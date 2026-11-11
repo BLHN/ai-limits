@@ -91,15 +91,13 @@ let builtInPrices: [String: ModelPrice] = {
 
 // MARK: - Paths
 
-private let applicationSupport = "Library/Application Support/AILimits"
-
-var pricesURL: URL { realHome.appendingPathComponent(applicationSupport + "/prices.json") }
+var pricesURL: URL { appDataFolder.appendingPathComponent("prices.json") }
 
 var defaultAutoPricesURL: URL {
     if let custom = ProcessInfo.processInfo.environment["AI_LIMITS_PRICES_AUTO"], !custom.isEmpty {
         return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
     }
-    return realHome.appendingPathComponent(applicationSupport + "/prices-auto.json")
+    return appDataFolder.appendingPathComponent("prices-auto.json")
 }
 
 // MARK: - User file (prices.json)

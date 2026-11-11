@@ -677,7 +677,7 @@ var defaultUsageCacheURL: URL {
     if let custom = ProcessInfo.processInfo.environment["AI_LIMITS_USAGE_CACHE"], !custom.isEmpty {
         return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
     }
-    return realHome.appendingPathComponent("Library/Application Support/AILimits/usage-cache.json")
+    return appDataFolder.appendingPathComponent("usage-cache.json")
 }
 
 /// The dedupe hashes live next to the JSON cache in a compact binary file.

@@ -3,7 +3,8 @@ import Darwin
 
 // Which accounts the app shows and where their CLIs live. The list comes from an optional
 // user-edited accounts.json; without it the installed CLIs are detected. Nothing here reads
-// credentials or account state: only paths and the user's own labels.
+// credentials: only paths and the user's own labels (the --accounts report also shows the
+// Claude login email from the profile state file, masked).
 
 struct AccountConfig: Equatable, Sendable {
     let id: String
@@ -15,7 +16,14 @@ struct AccountConfig: Equatable, Sendable {
 
     var slot: AccountSlot { AccountSlot(id: id, kind: kind, name: name) }
 
-    /// Claude profile state file; only oauthAccount.subscriptionCreatedAt is read from it.
+    /// Same id, type and folder: the same login, whatever its name. A fetch result is applied
+    /// only while its account still matches this way.
+    func sameFolder(as other: AccountConfig) -> Bool {
+        other.id == id && other.kind == kind && other.directory == directory
+    }
+
+    /// Claude profile state file; only oauthAccount.subscriptionCreatedAt, emailAddress and
+    /// planDisplayName are read from it (Fetchers.swift).
     var claudeStateFile: URL {
         directory.map { URL(fileURLWithPath: $0).appendingPathComponent(".claude.json") }
             ?? realHome.appendingPathComponent(".claude.json")
@@ -33,11 +41,11 @@ struct AccountsConfiguration: Equatable, Sendable {
 
     var slots: [AccountSlot] { accounts.map(\.slot) }
     var ids: [String] { accounts.map(\.id) }
-    var codex: AccountConfig? { accounts.first { $0.kind == .codex } }
+    var codexAccounts: [AccountConfig] { accounts.filter { $0.kind == .codex } }
     var claudeAccounts: [AccountConfig] { accounts.filter { $0.kind == .claude } }
 }
 
-var accountsURL: URL { realHome.appendingPathComponent("Library/Application Support/AILimits/accounts.json") }
+var accountsURL: URL { appDataFolder.appendingPathComponent("accounts.json") }
 
 func accountsModificationDate() -> Date? {
     (try? FileManager.default.attributesOfItem(atPath: accountsURL.path))?[.modificationDate] as? Date
@@ -82,9 +90,6 @@ func parseAccountsFile(_ data: Data, home: URL, isExecutable: (String) -> Bool) 
         guard let kind = (entry["type"] as? String).flatMap(AccountKind.init(rawValue:)) else {
             problems.append(L("\(label): type must be \"claude\" or \"codex\"", "\(label): type должен быть \"claude\" или \"codex\"")); continue
         }
-        if kind == .codex, entries.contains(where: { $0.kind == .codex }) {
-            problems.append(L("\(label): only one codex account is supported", "\(label): поддерживается только один аккаунт codex")); continue
-        }
         let key = kind == .claude ? "configDir" : "home"
         var directory: String?
         if let raw = entry[key] {
@@ -92,6 +97,18 @@ func parseAccountsFile(_ data: Data, home: URL, isExecutable: (String) -> Bool) 
                 problems.append(L("\(label): \(key) must be an absolute path", "\(label): \(key) должен быть абсолютным путём")); continue
             }
             directory = path
+        }
+        // Several Codex logins need separate homes; only one may use the default (~/.codex).
+        if kind == .codex {
+            let homeKey = codexHomeKey(directory, home: home)
+            if entries.contains(where: { $0.kind == .codex && codexHomeKey($0.directory, home: home) == homeKey }) {
+                problems.append(directory == nil || homeKey == codexHomeKey(nil, home: home)
+                    ? L("\(label): only one codex account can use the default home; give it its own \"home\"",
+                        "\(label): основной home может быть только у одного аккаунта codex; укажите отдельный \"home\"")
+                    : L("\(label): another codex account already uses this home",
+                        "\(label): этот home уже занят другим аккаунтом codex"))
+                continue
+            }
         }
         let name = (entry["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         entries.append((id, kind, name.flatMap { $0.isEmpty ? nil : String($0.prefix(32)) }, directory))
@@ -101,12 +118,17 @@ func parseAccountsFile(_ data: Data, home: URL, isExecutable: (String) -> Bool) 
         entries = Array(entries.prefix(maxAccounts))
     }
     let claudeCount = entries.filter { $0.kind == .claude }.count
+    let codexCount = entries.filter { $0.kind == .codex }.count
     var claudeIndex = 0
+    var codexIndex = 0
     let accounts = entries.map { entry -> AccountConfig in
-        var fallback = "Codex"
+        let fallback: String
         if entry.kind == .claude {
             claudeIndex += 1
             fallback = claudeCount == 1 ? "Claude" : "Claude \(claudeIndex)"
+        } else {
+            codexIndex += 1
+            fallback = codexCount == 1 ? "Codex" : "Codex \(codexIndex)"
         }
         return AccountConfig(id: entry.id, kind: entry.kind, name: entry.name ?? fallback, directory: entry.directory)
     }
@@ -122,6 +144,11 @@ func parseAccountsFile(_ data: Data, home: URL, isExecutable: (String) -> Bool) 
         }
     }
     return ParsedAccountsFile(accounts: accounts, cli: cli, problems: problems)
+}
+
+/// Comparable Codex home: the folder, with the default (no "home") meaning ~/.codex.
+func codexHomeKey(_ directory: String?, home: URL) -> String {
+    URL(fileURLWithPath: directory ?? home.appendingPathComponent(".codex").path).standardizedFileURL.path
 }
 
 private func warningText(_ problems: [String]) -> String? {
@@ -237,11 +264,31 @@ func nextClaudeID(existing: [String]) -> String {
     return "claude-\(number)"
 }
 
+/// "codex" for the first Codex account, then the smallest free "codex-N", N >= 2.
+func nextCodexID(existing: [String]) -> String {
+    if !existing.contains("codex") { return "codex" }
+    var number = 2
+    while existing.contains("codex-\(number)") { number += 1 }
+    return "codex-\(number)"
+}
+
+func nextAccountID(kind: AccountKind, existing: [String]) -> String {
+    kind == .claude ? nextClaudeID(existing: existing) : nextCodexID(existing: existing)
+}
+
+/// Hidden folder prefix of a login folder: ".claude" or ".codex".
+func loginFolderPrefix(_ kind: AccountKind) -> String { kind == .claude ? ".claude" : ".codex" }
+
 /// "~/.claude-<slug>" for a new Claude login; "-2", "-3"... when the folder is already in use
 /// (by another account or on disk, as `exists` says).
 func suggestedClaudeFolder(name: String, home: URL, taken: [String], exists: (String) -> Bool) -> String {
+    suggestedLoginFolder(kind: .claude, name: name, home: home, taken: taken, exists: exists)
+}
+
+/// "~/.claude-<slug>" or "~/.codex-<slug>" for a new login, unique like suggestedClaudeFolder.
+func suggestedLoginFolder(kind: AccountKind, name: String, home: URL, taken: [String], exists: (String) -> Bool) -> String {
     let slug = accountSlug(name)
-    let base = ".claude-" + (slug.isEmpty ? "account" : slug)
+    let base = loginFolderPrefix(kind) + "-" + (slug.isEmpty ? "account" : slug)
     var candidate = base
     var number = 2
     func path(_ folder: String) -> String { home.appendingPathComponent(folder).path }
@@ -253,27 +300,43 @@ func suggestedClaudeFolder(name: String, home: URL, taken: [String], exists: (St
 }
 
 /// Label for a found login folder: ".claude-work" -> "Claude Work", ".claude2" -> "Claude 2".
-func suggestedName(forClaudeFolder path: String) -> String {
+func suggestedName(forClaudeFolder path: String) -> String { suggestedName(forFolder: path, kind: .claude) }
+
+/// ".codex-work" -> "Codex Work"; the Claude rule for ".claude..." folders.
+func suggestedName(forFolder path: String, kind: AccountKind) -> String {
     let folder = (path as NSString).lastPathComponent
-    var rest = folder.hasPrefix(".claude") ? String(folder.dropFirst(7)) : folder
+    let prefix = loginFolderPrefix(kind)
+    var rest = folder.hasPrefix(prefix) ? String(folder.dropFirst(prefix.count)) : folder
     rest = rest.trimmingCharacters(in: CharacterSet(charactersIn: "-_. "))
     let words = rest.split(whereSeparator: { $0 == "-" || $0 == "_" || $0 == "." || $0 == " " })
         .map { $0.prefix(1).uppercased() + $0.dropFirst() }
-    return String((["Claude"] + words).joined(separator: " ").prefix(32))
+    return String(([kind == .claude ? "Claude" : "Codex"] + words).joined(separator: " ").prefix(32))
 }
 
 /// Extra Claude logins in `home`: folders whose name starts with ".claude" (not ".claude"
 /// itself) that contain a ".claude.json" file. Only directory names and the file's existence
 /// are checked; nothing is read. Sorted by name, at most `limit`.
 func discoverClaudeLogins(home: URL, limit: Int = 8, fileManager: FileManager = .default) -> [String] {
+    discoverLogins(kind: .claude, home: home, limit: limit, fileManager: fileManager)
+}
+
+/// Extra Codex logins: folders named ".codex..." (not ".codex") that contain an "auth.json".
+/// Only its existence is checked; the file is never opened.
+func discoverCodexLogins(home: URL, limit: Int = 8, fileManager: FileManager = .default) -> [String] {
+    discoverLogins(kind: .codex, home: home, limit: limit, fileManager: fileManager)
+}
+
+func discoverLogins(kind: AccountKind, home: URL, limit: Int = 8, fileManager: FileManager = .default) -> [String] {
     guard let names = try? fileManager.contentsOfDirectory(atPath: home.path) else { return [] }
+    let prefix = loginFolderPrefix(kind)
+    let marker = kind == .claude ? ".claude.json" : "auth.json"
     var found: [String] = []
     for name in names.sorted(by: { $0.localizedStandardCompare($1) == .orderedAscending })
-    where name.hasPrefix(".claude") && name != ".claude" {
+    where name.hasPrefix(prefix) && name != prefix {
         let path = home.appendingPathComponent(name).path
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue,
-              fileManager.fileExists(atPath: path + "/.claude.json") else { continue }
+              fileManager.fileExists(atPath: path + "/" + marker) else { continue }
         found.append(path)
         if found.count >= limit { break }
     }
@@ -343,13 +406,13 @@ enum TerminalTask: Equatable, Sendable {
 func terminalInstructions(_ task: TerminalTask) -> [String] {
     switch task {
     case .claudeTrust:
-        return [L("AI Limits: Claude Code will ask whether you trust this folder. Choose \"Yes\".",
-                  "AI Limits: Claude Code спросит, доверяете ли вы этой папке. Выберите «Yes»."),
+        return [L("AI Limits: Claude Code will ask whether you trust this folder. Use the arrow keys to pick \"Yes, I trust this folder\", then press Enter.",
+                  "AI Limits: Claude Code спросит, доверяете ли вы этой папке. Стрелками выберите «Yes, I trust this folder» и нажмите Enter."),
                 L("Then type /exit and close this window. AI Limits never types here.",
                   "Потом введите /exit и закройте это окно. AI Limits сам здесь ничего не вводит.")]
     case .claudeLogin:
-        return [L("AI Limits: if Claude Code asks whether you trust this folder, choose \"Yes\".",
-                  "AI Limits: если Claude Code спросит, доверяете ли вы этой папке, выберите «Yes»."),
+        return [L("AI Limits: if Claude Code asks whether you trust this folder, pick \"Yes, I trust this folder\" with the arrow keys and press Enter.",
+                  "AI Limits: если Claude Code спросит, доверяете ли вы этой папке, стрелками выберите «Yes, I trust this folder» и нажмите Enter."),
                 L("Then type /login, sign in with your Claude subscription, type /exit and close this window.",
                   "Потом введите /login, войдите в подписку Claude, введите /exit и закройте это окно.")]
     case .codexLogin:
@@ -363,8 +426,11 @@ func terminalInstructions(_ task: TerminalTask) -> [String] {
 /// Fixed-content zsh script for a .command file. Every path is single-quoted; nothing is piped
 /// into the CLI, which takes over the terminal through exec. For Claude the environment
 /// matches the app's own check: CLAUDE*/ANTHROPIC* variables are removed and CLAUDE_CONFIG_DIR
-/// is set only for an extra login.
-func terminalScript(task: TerminalTask, cli: String, directory: String?, probeFolder: String, home: URL) -> String {
+/// is set only for an extra login. For Codex, CODEX_HOME is the account's folder, or for the
+/// default login exactly what the app's own check inherits (unset in the usual case), so a
+/// CODEX_HOME exported in the user's shell profile cannot redirect the login to another folder.
+func terminalScript(task: TerminalTask, cli: String, directory: String?, probeFolder: String, home: URL,
+                    defaultCodexHome: String? = inheritedCodexHome()) -> String {
     var lines = ["#!/bin/zsh", "# Written by AI Limits. It starts your own CLI; AI Limits never types into it."]
     let cliFolder = (cli as NSString).deletingLastPathComponent
     lines.append("export PATH=\(shellQuote(cliFolder)):\"$PATH\"")
@@ -375,7 +441,11 @@ func terminalScript(task: TerminalTask, cli: String, directory: String?, probeFo
         if let directory { lines.append("export CLAUDE_CONFIG_DIR=\(shellQuote(directory))") }
     case .codexLogin:
         lines.append("cd \(shellQuote(home.path)) || exit 1")
-        if let directory { lines.append("export CODEX_HOME=\(shellQuote(directory))") }
+        if let codexHome = directory ?? defaultCodexHome {
+            lines.append("export CODEX_HOME=\(shellQuote(codexHome))")
+        } else {
+            lines.append("unset CODEX_HOME")
+        }
     }
     lines.append("printf '%s\\n' " + terminalInstructions(task).map(shellQuote).joined(separator: " ") + " ''")
     lines.append("exec \(shellQuote(cli))" + (task == .codexLogin ? " login" : ""))
@@ -391,19 +461,30 @@ func shellPath(_ path: String, home: URL) -> String {
     return shellQuote(path)
 }
 
-/// The same session as one line for another terminal app; the CLI is called by name.
-func terminalCommand(task: TerminalTask, directory: String?, probeFolder: String, home: URL) -> String {
+/// The same session as one line for another terminal app; the CLI is called by name. The folder
+/// variable is a prefix assignment (zsh expands "~" there, not in an argument to env), and the
+/// default logins drop CLAUDE_CONFIG_DIR / CODEX_HOME inherited from the user's shell.
+func terminalCommand(task: TerminalTask, directory: String?, probeFolder: String, home: URL,
+                     defaultCodexHome: String? = inheritedCodexHome()) -> String {
     switch task {
     case .claudeTrust, .claudeLogin:
-        let variable = directory.map { "CLAUDE_CONFIG_DIR=\(shellPath($0, home: home)) " } ?? ""
         // An exported API key would make claude sign in with it instead of the subscription.
-        return "cd \(shellPath(probeFolder, home: home)) && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \(variable)claude"
+        let clean = "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN"
+        let command = directory.map { "CLAUDE_CONFIG_DIR=\(shellPath($0, home: home)) \(clean) claude" }
+            ?? "\(clean) -u CLAUDE_CONFIG_DIR claude"
+        return "cd \(shellPath(probeFolder, home: home)) && " + command
     case .codexLogin:
-        return directory.map { "CODEX_HOME=\(shellPath($0, home: home)) codex login" } ?? "codex login"
+        if let codexHome = directory ?? defaultCodexHome { return "CODEX_HOME=\(shellPath(codexHome, home: home)) codex login" }
+        return "env -u CODEX_HOME codex login"
     }
 }
 
-var onboardingScriptsFolder: URL { realHome.appendingPathComponent("Library/Application Support/AILimits/Onboarding") }
+/// CODEX_HOME as the app's own check of the default Codex login sees it (normally unset).
+func inheritedCodexHome(environment: [String: String] = ProcessInfo.processInfo.environment, home: URL = realHome) -> String? {
+    environment["CODEX_HOME"].flatMap { expandedPath($0, home: home) }
+}
+
+var onboardingScriptsFolder: URL { appDataFolder.appendingPathComponent("Onboarding") }
 
 /// Writes `<name>.command` (mode 0700) into the Onboarding folder (0700) and returns its URL.
 func writeTerminalScript(_ content: String, name: String, folder: URL = onboardingScriptsFolder) throws -> URL {
@@ -532,7 +613,7 @@ func loginShellLookup(_ name: String, timeout: TimeInterval = 4) -> String? {
 
 extension UsageSources {
     /// Claude: <configDir or ~/.claude>/projects per Claude account, deduplicated.
-    /// Codex: <home or $CODEX_HOME or ~/.codex>/sessions when a Codex account is configured.
+    /// Codex: <home or $CODEX_HOME or ~/.codex>/sessions per Codex account, deduplicated.
     init(configuration: AccountsConfiguration, home: URL = realHome,
          environment: [String: String] = ProcessInfo.processInfo.environment) {
         var claude: [URL] = []
@@ -542,10 +623,11 @@ extension UsageSources {
             if !claude.contains(where: { $0.path == root.path }) { claude.append(root) }
         }
         var codex: [URL] = []
-        if let account = configuration.codex {
+        for account in configuration.codexAccounts {
             let base = account.directory ?? environment["CODEX_HOME"].flatMap { expandedPath($0, home: home) }
                 ?? home.appendingPathComponent(".codex").path
-            codex.append(URL(fileURLWithPath: base).appendingPathComponent("sessions").standardizedFileURL)
+            let root = URL(fileURLWithPath: base).appendingPathComponent("sessions").standardizedFileURL
+            if !codex.contains(where: { $0.path == root.path }) { codex.append(root) }
         }
         self.init(claudeRoots: claude, codexRoots: codex)
     }
@@ -554,7 +636,8 @@ extension UsageSources {
 // MARK: - CLI report
 
 /// `AILimits --accounts`: the resolved list and any warning. Locates the CLIs, never runs them
-/// (only the login shell may be asked for a path).
+/// (only the login shell may be asked for a path). A Claude login's email from its profile
+/// state file is printed masked; Codex emails need a live check and are not shown here.
 func runAccountsReport() {
     let configuration = loadAccountsConfiguration()
     let exists = FileManager.default.fileExists(atPath: accountsURL.path)
@@ -568,7 +651,13 @@ func runAccountsReport() {
         var directory = account.directory ?? "default"
         if let path = account.directory, !FileManager.default.fileExists(atPath: path) { directory += " (missing)" }
         let cli = CLILocator.shared.locate(account.kind.rawValue) ?? "not found"
-        print("\(account.id): type=\(account.kind.rawValue) name=\"\(account.name)\" \(key)=\(directory) cli=\(cli)")
+        var login = ""
+        if account.kind == .claude {
+            let profile = claudeProfile(account)
+            login = " email=" + (profile?.email.map(maskedEmail) ?? "unknown")
+            if let plan = profile?.plan { login += " plan=\"\(plan)\"" }
+        }
+        print("\(account.id): type=\(account.kind.rawValue) name=\"\(account.name)\" \(key)=\(directory) cli=\(cli)\(login)")
     }
     print("warning: \(configuration.warning ?? "none")")
 }

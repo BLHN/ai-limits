@@ -4,7 +4,9 @@ import Darwin
 // Host-only quota fetchers. They launch the user's installed `codex` and `claude` CLIs
 // and read what those tools print. This file never reads tokens, credentials or the
 // keychain and makes no network or model requests of its own. Nothing here logs,
-// prints or stores emails, account ids or tokens.
+// prints or stores emails, account ids or tokens. Login emails and plan names are read only
+// from the Claude profile state file (oauthAccount.emailAddress / planDisplayName) and the
+// Codex app-server's account/read answer; they are kept in memory for the UI and nothing else.
 
 /// `description` is for the terminal (`--check`); the UI shows only the hint for `reason`.
 struct FetchError: Error, CustomStringConvertible {
@@ -26,7 +28,66 @@ var realHome: URL {
     return URL(fileURLWithPath: home)
 }
 
+/// The app's data folder: ~/Library/Application Support/AILimits, or AI_LIMITS_DATA_DIR
+/// (absolute or "~/...") for isolated test runs. The widget always reads the fixed folder.
+/// nil when AI_LIMITS_DATA_DIR is set but is not such a path: the app then refuses to start
+/// rather than silently using the real folder.
+func appDataDirectory(environment: [String: String] = ProcessInfo.processInfo.environment, home: URL = realHome) -> URL? {
+    guard let custom = environment["AI_LIMITS_DATA_DIR"], !custom.isEmpty else {
+        return home.appendingPathComponent("Library/Application Support/AILimits")
+    }
+    return expandedPath(custom, home: home).map { URL(fileURLWithPath: $0) }
+}
+
+/// AI_LIMITS_DATA_DIR is set: preferences and the login item are kept away from the real app too.
+func appDataOverridden(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    !(environment["AI_LIMITS_DATA_DIR"] ?? "").isEmpty
+}
+
+let dataDirectoryError = "error: AI_LIMITS_DATA_DIR must be an absolute path or start with ~/\n"
+
+/// Resolved once per process. Launch.main checks the override before anything reads it.
+let appDataFolder: URL = appDataDirectory() ?? { fputs(dataDirectoryError, stderr); exit(64) }()
+
+/// Preferences domain for a test run: its own suite per data folder, so a run with
+/// AI_LIMITS_DATA_DIR never changes the real app's settings (onboarding done, Hide Emails, panel).
+func preferencesSuiteName(forDataFolder folder: URL) -> String {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for byte in folder.standardizedFileURL.path.utf8 { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+    return "local.ai-limits.test-" + String(hash, radix: 16)
+}
+
+let appDefaults: UserDefaults = appDataOverridden()
+    ? (UserDefaults(suiteName: preferencesSuiteName(forDataFolder: appDataFolder)) ?? .standard)
+    : .standard
+
+/// The floating panel's saved frame; a test run keeps its own.
+let panelFrameName = appDataOverridden() ? "AILimitsPosition-test" : "AILimitsPosition"
+
+/// Where the host publishes the widget snapshot (the data folder).
+var hostSnapshotURL: URL { appDataFolder.appendingPathComponent("widget-snapshot.json") }
+
 func iso8601(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
+
+/// A plausible login email from a JSON value: one line, at most 254 characters, with "@"
+/// between a local part and a domain. Anything else is dropped.
+func sanitizedEmail(_ value: Any?) -> String? {
+    guard let text = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          (3...254).contains(text.count),
+          !text.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
+          let at = text.lastIndex(of: "@"), at != text.startIndex, text.index(after: at) != text.endIndex
+    else { return nil }
+    return text
+}
+
+/// A short one-line plan name ("Claude Max"); nil for anything else.
+func sanitizedPlanName(_ value: Any?) -> String? {
+    guard let text = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          (1...40).contains(text.count),
+          !text.unicodeScalars.contains(where: { CharacterSet.newlines.contains($0) || CharacterSet.controlCharacters.contains($0) })
+    else { return nil }
+    return text
+}
 
 private func finiteNumber(_ value: Any?) -> Double? {
     guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
@@ -148,14 +209,7 @@ func codexMeta(fromResponse data: Data) -> CodexMeta {
         if minutes <= 1440 { meta.sessionWindow = meta.sessionWindow ?? minutes * 60 }
         else { meta.weeklyWindow = meta.weeklyWindow ?? minutes * 60 }
     }
-    if let plan = limits["planType"] as? String {
-        let trimmed = plan.trimmingCharacters(in: .whitespaces)
-        // Only a short plain word is shown; anything else is ignored.
-        if (1...24).contains(trimmed.count), trimmed.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }),
-           trimmed.lowercased() != "unknown" {
-            meta.plan = trimmed.replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
+    if let plan = limits["planType"] as? String { meta.plan = codexPlanName(plan) }
     if let credits = limits["credits"] as? [String: Any], credits["hasCredits"] as? Bool == true,
        credits["unlimited"] as? Bool != true {
         let balance = finiteNumber(credits["balance"]) ?? (credits["balance"] as? String).flatMap(Double.init)
@@ -164,9 +218,40 @@ func codexMeta(fromResponse data: Data) -> CodexMeta {
     return meta
 }
 
+/// Display name of a Codex plan type: "pro" -> "Pro", "plus" -> "Plus", "team", "business",
+/// "enterprise", "edu" title-cased, any other short word title-cased as it is. Only a short
+/// plain word is shown; "unknown" and anything else give nil.
+func codexPlanName(_ raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespaces)
+    guard (1...24).contains(trimmed.count), trimmed.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }),
+          trimmed.lowercased() != "unknown" else { return nil }
+    let known = ["pro": "Pro", "plus": "Plus", "team": "Team", "business": "Business", "enterprise": "Enterprise", "edu": "Edu"]
+    return known[trimmed.lowercased()] ?? trimmed.replacingOccurrences(of: "_", with: " ").capitalized
+}
+
+/// The login of a Codex home, from the app-server's account/read answer. Host-only, in memory.
+struct CodexAccountInfo: Equatable, Sendable {
+    var email: String?
+    var plan: String?
+}
+
+/// Parses `{"id":3,"result":{"account":{"type":"chatgpt","email":"...","planType":"pro"},...}}`.
+/// Only result.account.email and result.account.planType are read. nil when there is no
+/// account, an error, or neither field (an API-key login carries no email or plan).
+func codexAccount(fromResponse data: Data) -> CodexAccountInfo? {
+    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          object["error"] == nil,
+          let account = (object["result"] as? [String: Any])?["account"] as? [String: Any] else { return nil }
+    let info = CodexAccountInfo(email: sanitizedEmail(account["email"]),
+                                plan: (account["planType"] as? String).flatMap(codexPlanName))
+    return info.email == nil && info.plan == nil ? nil : info
+}
+
 struct CodexReading {
     let usage: Usage
     let meta: CodexMeta
+    /// From account/read in the same session; nil when that request failed or had no login.
+    var account: CodexAccountInfo? = nil
 }
 
 /// Asks `codex app-server` for the current rate limits over newline-delimited JSON-RPC.
@@ -206,7 +291,8 @@ func fetchCodexUsage(_ account: AccountConfig, timeout: TimeInterval = 20) throw
         do { try input.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8)) }
         catch { throw FetchError("Codex: app-server closed its input") }
     }
-    func response(id: Int) throws -> Data {
+    func response(id: Int, until limit: Date? = nil) throws -> Data {
+        let deadline = min(deadline, limit ?? deadline)
         while true {
             while let newline = buffer.firstIndex(of: 0x0A) {
                 let line = Data(buffer[buffer.startIndex..<newline])
@@ -230,7 +316,15 @@ func fetchCodexUsage(_ account: AccountConfig, timeout: TimeInterval = 20) throw
     try send(#"{"method":"initialized"}"#)
     try send(#"{"id":2,"method":"account/rateLimits/read"}"#)
     let line = try response(id: 2)
-    return CodexReading(usage: try codexUsage(fromResponse: line, now: Date()), meta: codexMeta(fromResponse: line))
+    let usage = try codexUsage(fromResponse: line, now: Date())
+    // The login's email and plan, in the same session. Optional: a failure or a slow answer
+    // never fails the limits that were already read.
+    var account: CodexAccountInfo?
+    if (try? send(#"{"id":3,"method":"account/read","params":{}}"#)) != nil,
+       let answer = try? response(id: 3, until: Date().addingTimeInterval(5)) {
+        account = codexAccount(fromResponse: answer)
+    }
+    return CodexReading(usage: usage, meta: codexMeta(fromResponse: line), account: account)
 }
 
 // MARK: - Claude: terminal text
@@ -407,15 +501,44 @@ func parseClaudeUsage(_ raw: String, now: Date) throws -> ClaudeUsageReading {
 
 // MARK: - Claude: pseudo-terminal session
 
-/// Only `oauthAccount.subscriptionCreatedAt` is taken from the profile state file.
-func claudeSubscriptionAnchor(_ account: AccountConfig) -> String? {
-    guard account.kind == .claude, let object = readJSONObject(account.claudeStateFile),
-          let anchor = (object["oauthAccount"] as? [String: Any])?["subscriptionCreatedAt"] as? String,
-          nextPayment(anchor: anchor, now: Date()) != nil else { return nil }
-    return anchor
+/// What the app takes from a Claude profile state file: oauthAccount.subscriptionCreatedAt,
+/// emailAddress and planDisplayName. Everything else in the file is discarded. The email and
+/// plan stay in memory only.
+struct ClaudeProfile: Equatable, Sendable {
+    var anchor: String?
+    var email: String?
+    var plan: String?
 }
 
-var billingURL: URL { realHome.appendingPathComponent("Library/Application Support/AILimits/billing.json") }
+/// Pure parser for the state file's content. nil when the content is not a JSON object (a file
+/// caught mid-write, say): the caller then keeps what it knew. A parsed file without
+/// oauthAccount yields an empty profile (signed out).
+func claudeProfile(fromStateData data: Data, now: Date = Date()) -> ClaudeProfile? {
+    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+    guard let oauth = object["oauthAccount"] as? [String: Any] else { return ClaudeProfile() }
+    let anchor = (oauth["subscriptionCreatedAt"] as? String).flatMap { nextPayment(anchor: $0, now: now) != nil ? $0 : nil }
+    return ClaudeProfile(anchor: anchor, email: sanitizedEmail(oauth["emailAddress"]),
+                         plan: sanitizedPlanName(oauth["planDisplayName"]))
+}
+
+/// nil when the state file exists but cannot be read or parsed (keep the previous profile);
+/// an empty profile when there is no state file at all.
+func claudeProfile(_ account: AccountConfig) -> ClaudeProfile? {
+    guard account.kind == .claude else { return ClaudeProfile() }
+    let file = account.claudeStateFile
+    guard FileManager.default.fileExists(atPath: file.path) else { return ClaudeProfile() }
+    guard let data = try? Data(contentsOf: file) else { return nil }
+    return claudeProfile(fromStateData: data)
+}
+
+/// Keeps the previous profile when the new read failed (nil).
+func mergedClaudeProfile(previous: ClaudeProfile?, read: ClaudeProfile?) -> ClaudeProfile? {
+    read ?? previous
+}
+
+func claudeSubscriptionAnchor(_ account: AccountConfig) -> String? { claudeProfile(account)?.anchor }
+
+var billingURL: URL { appDataFolder.appendingPathComponent("billing.json") }
 
 /// Manual payment anchors keyed by account id; malformed keys and entries are ignored.
 func loadBillingOverrides() -> [String: String] {
@@ -432,7 +555,7 @@ var claudeProbeFolderURL: URL {
     if let custom = ProcessInfo.processInfo.environment["AI_LIMITS_PROBE_DIR"], !custom.isEmpty {
         return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
     }
-    return realHome.appendingPathComponent("Library/Application Support/AILimits/ClaudeProbe")
+    return appDataFolder.appendingPathComponent("ClaudeProbe")
 }
 
 func claudeProbeDirectory() throws -> URL {
@@ -565,9 +688,26 @@ func fetchClaudeUsage(_ account: AccountConfig) throws -> ClaudeUsageReading {
     if child.hasClosed && warmup.isEmpty { throw FetchError("Claude: claude exited without output") }
 
     child.resize(rows: 60, columns: 170)
+    let started = Date()
     let fresh = child.read(for: 5) { data, quiet in
         guard quiet >= 1.5, !data.isEmpty else { return false }
         return (try? parseClaudeUsage(String(decoding: data, as: UTF8.self), now: Date()))?.isComplete ?? false
     }
-    return try parseClaudeUsage(String(decoding: fresh, as: UTF8.self), now: Date())
+    do {
+        return try parseClaudeUsage(String(decoding: fresh, as: UTF8.self), now: Date())
+    } catch let error as FetchError where error.reason == .notLoggedIn {
+        // "Not signed in" only when claude actually repainted a screen without limits in time;
+        // no repaint, or a read stretched by sleep or load, is an ordinary failed check.
+        let reason = claudeMissingUsageReason(repaintBytes: fresh.count, readSeconds: Date().timeIntervalSince(started))
+        guard reason == .notLoggedIn else {
+            throw FetchError("Claude: /usage did not finish drawing in time (no fresh repaint)", reason: reason)
+        }
+        throw error
+    }
+}
+
+/// Why a /usage read found no limits section: .notLoggedIn only when claude repainted a
+/// screen within the expected time (5 s read plus some slack); otherwise .failed.
+func claudeMissingUsageReason(repaintBytes: Int, readSeconds: TimeInterval) -> FetchFailure {
+    repaintBytes > 0 && readSeconds < 12 ? .notLoggedIn : .failed
 }

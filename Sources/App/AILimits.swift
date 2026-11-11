@@ -5,14 +5,32 @@ import WidgetKit
 import ServiceManagement
 
 // The host app fetches quotas itself by launching the user's installed `codex` and
-// `claude` CLIs (see Fetchers.swift). It reads only oauthAccount.subscriptionCreatedAt
-// from the Claude profile state files and an optional user-edited billing.json. It never
-// reads credentials, changes accounts, or makes network/model requests of its own.
+// `claude` CLIs (see Fetchers.swift). From the Claude profile state files it reads only
+// oauthAccount.subscriptionCreatedAt, emailAddress and planDisplayName, plus an optional
+// user-edited billing.json. Login emails stay in memory for the UI. It never reads
+// credentials, changes accounts, or makes network/model requests of its own.
 // Analytics.swift reads token counters from the local CLI logs; History.swift keeps a
 // local history of remaining percentages.
 
 private let codexInterval: TimeInterval = 60
-private let claudeInterval: TimeInterval = 120
+
+/// At most this many Codex app-server checks run at the same time; the rest wait for a slot.
+let maxConcurrentCodexChecks = 2
+
+/// The due Codex accounts to start now, in list order: as many as the free slots allow.
+func codexChecksToStart(due: [String], running: Int, limit: Int = maxConcurrentCodexChecks) -> [String] {
+    Array(due.prefix(max(0, limit - running)))
+}
+
+/// How long after its last check a Claude account is due again. Claude checks run one at a
+/// time and take about 15 s each, so with many accounts the cadence stretches to leave the
+/// sequence a short idle gap: 2 minutes for up to 6 accounts, 2.5 minutes for 8.
+func claudeCheckInterval(accountCount: Int) -> TimeInterval {
+    max(120, Double(accountCount) * 15 + 30)
+}
+
+/// "hideEmails" user default: login emails are shown masked everywhere in the UI.
+let hideEmailsKey = "hideEmails"
 
 /// Publishes are serialized so an older result never overwrites a newer file.
 private let publishQueue = DispatchQueue(label: "ai-limits.publish")
@@ -22,7 +40,7 @@ func publish(_ rows: [AccountRow]) throws -> Bool {
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
     let published = try encoder.encode(PublishedSnapshot(rows: rows))
-    let destination = publishedSnapshotURL
+    let destination = hostSnapshotURL
     try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
         withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     let changed = (try? Data(contentsOf: destination)) != published
@@ -37,12 +55,13 @@ private func billingModificationDate() -> Date? {
     (try? FileManager.default.attributesOfItem(atPath: billingURL.path))?[.modificationDate] as? Date
 }
 
-/// Short remaining summary for the menu bar tooltip.
-func remainingSummary(_ accounts: [AccountRow]) -> String {
+/// Short remaining summary for the menu bar tooltip; a known login email follows the name.
+func remainingSummary(_ accounts: [AccountRow], hideEmails: Bool = false) -> String {
     let lines = accounts.map { account -> String in
         let parts = [account.usage?.primary.map { L("session", "сеанс") + " \(Int($0.remaining.rounded()))%" },
                      account.usage?.secondary.map { L("week", "неделя") + " \(Int($0.remaining.rounded()))%" }].compactMap { $0 }
-        return "\(account.name): \(parts.isEmpty ? L("no data", "нет данных") : parts.joined(separator: ", "))"
+        let login = account.email.map { " (" + (hideEmails ? maskedEmail($0) : $0) + ")" } ?? ""
+        return "\(account.name)\(login): \(parts.isEmpty ? L("no data", "нет данных") : parts.joined(separator: ", "))"
     }
     return ([L("AI Limits — remaining", "AI Limits — остаток")] + lines).joined(separator: "\n")
 }
@@ -50,7 +69,10 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
 @MainActor @Observable final class QuotaStore {
     private(set) var usages: [String: Usage] = [:]
     private(set) var models: [String: [ModelQuota]] = [:]
-    private var claudeAnchors: [String: String] = [:]
+    /// Payment anchor, login email and plan per Claude account (email and plan in memory only).
+    private var claudeProfiles: [String: ClaudeProfile] = [:]
+    /// Login email and plan per Codex account from account/read (in memory only).
+    private var codexAccounts: [String: CodexAccountInfo] = [:]
     private var billing: [String: String] = [:]
     /// Category of the last failure per account; cleared by the next success. No CLI text is kept.
     private(set) var lastErrors: [String: FetchFailure] = [:]
@@ -60,8 +82,12 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
     private(set) var inFlight: Set<String> = []
     /// Accounts asked to check now that have not started yet.
     private(set) var queued: Set<String> = []
-    /// Window lengths and plan from the Codex response. Host-only, never published.
-    private(set) var codexMeta: CodexMeta?
+    /// Window lengths and plan from each Codex response. Host-only, never published.
+    private(set) var codexMeta: [String: CodexMeta] = [:]
+    /// Login emails are shown masked ("hideEmails" user default).
+    var hideEmails = appDefaults.bool(forKey: hideEmailsKey) {
+        didSet { appDefaults.set(hideEmails, forKey: hideEmailsKey) }
+    }
     /// Resolved accounts; nil until the first load finishes (nothing is fetched or published before).
     private(set) var configuration: AccountsConfiguration?
     var now = Date()
@@ -73,10 +99,15 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
     /// .distantFuture marks a fetch in flight; .distantPast means "due now".
     @ObservationIgnored private var nextDue: [String: Date] = [:]
     @ObservationIgnored private var rerunRequested: Set<String> = []
-    @ObservationIgnored private var claudeChainRunning = false
+    /// Observed: the onboarding cards say "in line" while another Claude check runs.
+    private var claudeChainRunning = false
+    /// Codex checks running right now (at most maxConcurrentCodexChecks).
+    @ObservationIgnored private var codexRunning: Set<String> = []
     @ObservationIgnored private var billingDate: Date?
     @ObservationIgnored private var accountsDate: Date?
     @ObservationIgnored private var configurationLoading = false
+    /// A reload was asked for while one was running: run one more after it, so a save is never lost.
+    @ObservationIgnored private var configurationReloadPending = false
     @ObservationIgnored private var configurationLoadedAt = Date.distantPast
     /// Rows shown before the configuration is known: the last published ones.
     @ObservationIgnored private let seedSlots: [AccountSlot]
@@ -89,10 +120,16 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
     var extras: [String: AccountExtras] {
         var result: [String: AccountExtras] = [:]
         for slot in slots {
+            let claude = slot.kind == .claude ? claudeProfiles[slot.id] : nil
+            let codex = slot.kind == .codex ? codexAccounts[slot.id] : nil
             result[slot.id] = AccountExtras(models: models[slot.id] ?? [],
-                                            billingAnchor: billing[slot.id] ?? claudeAnchors[slot.id],
-                                            weeklyWindow: slot.kind == .codex ? codexMeta?.weeklyWindow : weekWindow,
-                                            failure: lastErrors[slot.id])
+                                            billingAnchor: billing[slot.id] ?? claude?.anchor,
+                                            weeklyWindow: slot.kind == .codex ? codexMeta[slot.id]?.weeklyWindow : weekWindow,
+                                            failure: lastErrors[slot.id],
+                                            email: claude?.email ?? codex?.email,
+                                            plan: slot.kind == .claude ? claude?.plan
+                                                : codexPlanLabel(codexMeta[slot.id], account: codex),
+                                            dedicated: configuration?.accounts.first(where: { $0.id == slot.id })?.directory != nil)
         }
         return result
     }
@@ -104,12 +141,12 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
 
     init() {
         // Seed from the last published file so the panel is not empty before the first fetch.
-        let published = PublishedSnapshot.loadPublished()
+        let published = PublishedSnapshot.loadPublished(from: hostSnapshotURL)
         seedSlots = published?.map { AccountSlot(id: $0.id, kind: $0.kind, name: $0.name) } ?? placeholderSlots
         for row in published ?? [] {
             if let usage = row.usage { usages[row.id] = usage }
             models[row.id] = row.models
-            if row.kind == .claude, let anchor = row.billingAnchor { claudeAnchors[row.id] = anchor }
+            if row.kind == .claude, let anchor = row.billingAnchor { claudeProfiles[row.id] = ClaudeProfile(anchor: anchor) }
         }
         billingDate = billingModificationDate()
         accountsDate = accountsModificationDate()
@@ -151,12 +188,18 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
 
     /// Re-reads accounts.json (or re-detects the CLIs) off the main thread.
     private func reloadConfiguration() {
-        guard !configurationLoading else { return }
+        guard !configurationLoading else { configurationReloadPending = true; return }
         configurationLoading = true
+        configurationReloadPending = false
         Task {
             let loaded = await Task.detached(priority: .utility) { loadAccountsConfiguration() }.value
             configurationLoading = false
             configurationLoadedAt = Date()
+            // A newer request arrived while this load ran: its result may predate the file, so load again.
+            if configurationReloadPending {
+                reloadConfiguration()
+                return
+            }
             apply(loaded)
         }
     }
@@ -172,7 +215,9 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
                old.kind != account.kind || old.directory != account.directory {
                 usages[account.id] = nil
                 models[account.id] = nil
-                claudeAnchors[account.id] = nil
+                claudeProfiles[account.id] = nil
+                codexAccounts[account.id] = nil
+                codexMeta[account.id] = nil
                 lastErrors[account.id] = nil
                 lastErrorDetails[account.id] = nil
                 if nextDue[account.id] == .distantFuture { rerunRequested.insert(account.id) } else { nextDue[account.id] = .distantPast }
@@ -180,12 +225,17 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
         }
         let claude = loaded.claudeAccounts
         Task {
-            let anchors = await Task.detached(priority: .utility) { () -> [String: String] in
-                var anchors: [String: String] = [:]
-                for account in claude { anchors[account.id] = claudeSubscriptionAnchor(account) }
-                return anchors
+            let profiles = await Task.detached(priority: .utility) { () -> [String: ClaudeProfile?] in
+                var profiles: [String: ClaudeProfile?] = [:]
+                for account in claude { profiles[account.id] = claudeProfile(account) }
+                return profiles
             }.value
-            for (id, anchor) in anchors { claudeAnchors[id] = anchor }
+            // Only accounts that still have the same folder; an unreadable file keeps the last profile.
+            for account in claude where isCurrent(account) {
+                if let profile = profiles[account.id] {
+                    claudeProfiles[account.id] = mergedClaudeProfile(previous: claudeProfiles[account.id], read: profile)
+                }
+            }
             publishCurrent()
         }
         onConfiguration?(loaded)
@@ -218,7 +268,7 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
             reloadConfiguration()
         }
         guard let configuration else { onTick?(); return }
-        if let codex = configuration.codex, (nextDue[codex.id] ?? .distantPast) <= now { runCodex(codex) }
+        startDueCodex()
         if !claudeChainRunning {
             let due = configuration.claudeAccounts.filter { (nextDue[$0.id] ?? .distantPast) <= now }
             if !due.isEmpty { runClaude(due) }
@@ -226,21 +276,48 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
         onTick?()
     }
 
+    /// The account is still configured with the same id, type and folder. A result fetched for a
+    /// folder that was removed or replaced meanwhile (ids are reused) belongs to another login.
+    private func isCurrent(_ account: AccountConfig) -> Bool {
+        configuration?.accounts.contains { $0.sameFolder(as: account) } ?? false
+    }
+
     private func finish(_ id: String, interval: TimeInterval) {
         nextDue[id] = rerunRequested.remove(id) != nil ? .distantPast : Date().addingTimeInterval(interval)
+    }
+
+    /// Starts due Codex accounts in list order while a slot is free; the others stay due and
+    /// start as running checks finish. nextDue = .distantFuture guards one in flight per account.
+    private func startDueCodex() {
+        guard let configuration else { return }
+        let now = Date()
+        let due = configuration.codexAccounts.filter { (nextDue[$0.id] ?? .distantPast) <= now && !codexRunning.contains($0.id) }
+        let start = Set(codexChecksToStart(due: due.map(\.id), running: codexRunning.count))
+        for codex in due where start.contains(codex.id) { runCodex(codex) }
     }
 
     private func runCodex(_ account: AccountConfig) {
         let id = account.id
         nextDue[id] = .distantFuture
+        codexRunning.insert(id)
         inFlight.insert(id)
         queued.remove(id)
         Task {
             let result = await Task.detached(priority: .utility) { Result { try fetchCodexUsage(account) } }.value
+            codexRunning.remove(id)
+            // A slot is free: the next waiting account starts once this result is applied.
+            defer { startDueCodex() }
+            guard isCurrent(account) else {
+                inFlight.remove(id)
+                finish(id, interval: 0)
+                return
+            }
             switch result {
             case .success(let reading):
                 usages[id] = reading.usage
-                codexMeta = reading.meta
+                codexMeta[id] = reading.meta
+                // A failed account/read keeps the last known login rather than blanking it.
+                if let account = reading.account { codexAccounts[id] = account }
                 lastErrors[id] = nil
                 lastErrorDetails[id] = nil
                 history.record(id: id, usage: reading.usage, models: [])
@@ -255,22 +332,29 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
         }
     }
 
-    /// Claude accounts run one after another, never in parallel.
+    /// Claude accounts run one after another, never in parallel. Only one chain runs at a time
+    /// (claudeChainRunning); accounts that fall due meanwhile wait for the next chain, so every
+    /// account is checked once per cycle in the configured order and none is starved.
     private func runClaude(_ accounts: [AccountConfig]) {
         claudeChainRunning = true
+        let interval = claudeCheckInterval(accountCount: configuration?.claudeAccounts.count ?? accounts.count)
         Task {
             for account in accounts {
                 // The account may have been removed while earlier ones ran.
-                guard configuration?.accounts.contains(where: {
-                    $0.id == account.id && $0.kind == account.kind && $0.directory == account.directory
-                }) ?? false else { continue }
+                guard isCurrent(account) else { continue }
                 nextDue[account.id] = .distantFuture
                 inFlight.insert(account.id)
                 queued.remove(account.id)
-                let (result, anchor) = await Task.detached(priority: .utility) {
-                    (Result { try fetchClaudeUsage(account) }, claudeSubscriptionAnchor(account))
+                let (result, profile) = await Task.detached(priority: .utility) {
+                    (Result { try fetchClaudeUsage(account) }, claudeProfile(account))
                 }.value
-                if let anchor { claudeAnchors[account.id] = anchor }
+                // The folder was removed or replaced while the check ran: drop the stale result.
+                guard isCurrent(account) else {
+                    inFlight.remove(account.id)
+                    finish(account.id, interval: 0)
+                    continue
+                }
+                claudeProfiles[account.id] = mergedClaudeProfile(previous: claudeProfiles[account.id], read: profile)
                 switch result {
                 case .success(let reading):
                     usages[account.id] = reading.usage
@@ -284,7 +368,7 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
                     lastErrorDetails[account.id] = (error as? FetchError)?.description
                 }
                 inFlight.remove(account.id)
-                finish(account.id, interval: claudeInterval)
+                finish(account.id, interval: interval)
             }
             claudeChainRunning = false
         }
@@ -314,23 +398,62 @@ extension QuotaStore {
         let usage = usages[id]
         // No result of any kind yet: the first check is due now.
         let checking = inFlight.contains(id) || queued.contains(id) || (failure == nil && usage == nil)
-        return AccountCheckState(saved: true, checking: checking, failure: failure,
-                                 detail: failure == nil ? nil : lastErrorDetails[id], summary: usage.map(connectedSummary))
+        // Claude checks run one at a time: a card not yet started waits for the running chain.
+        // Codex checks run at most two at a time: a card not yet started waits for a free slot.
+        let waiting = checking && !inFlight.contains(id)
+            && (draft.kind == .claude ? claudeChainRunning : codexRunning.count >= maxConcurrentCodexChecks)
+        let row = accounts.first { $0.id == id }
+        return AccountCheckState(saved: true, checking: checking, waiting: waiting, failure: failure,
+                                 detail: failure == nil ? nil : lastErrorDetails[id], summary: usage.map(connectedSummary),
+                                 email: row?.email, plan: row?.plan)
     }
+}
+
+/// Tallest the popover or the floating panel may get: the visible height of the screen it is
+/// on, minus a margin. Each has its own instance, refreshed when it opens or changes screen.
+@MainActor @Observable final class ScreenLimits {
+    var maxHeight: CGFloat = ScreenLimits.height(of: NSScreen.main)
+    /// The screen this limit follows (the popover's menu bar, the panel's window).
+    @ObservationIgnored var screen: () -> NSScreen? = { NSScreen.main }
+    @ObservationIgnored private var observer: NSObjectProtocol?
+
+    init() {
+        observer = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+    }
+
+    func refresh() {
+        let height = ScreenLimits.height(of: screen() ?? NSScreen.main)
+        if height != maxHeight { maxHeight = height }
+    }
+
+    static func height(of screen: NSScreen?) -> CGFloat {
+        cappedHeight(visibleHeight: screen?.visibleFrame.height)
+    }
+}
+
+/// Visible screen height minus a 60 pt margin, never below 320 pt (800 pt when unknown).
+func cappedHeight(visibleHeight: CGFloat?) -> CGFloat {
+    max(320, (visibleHeight ?? 800) - 60)
 }
 
 struct Dashboard: View {
     let store: QuotaStore
+    let screen: ScreenLimits
     var onSetUp: (() -> Void)? = nil
     var onFix: ((String) -> Void)? = nil
     var body: some View {
-        LimitsSummary(accounts: store.accounts, now: store.now,
-            size: .panel, sourceError: store.allFetchersFailing, notice: store.configurationWarning,
-            onSetUp: onSetUp, onFix: onFix)
-            .padding(18)
-            .frame(width: 380)
-            .background(Palette.background)
-            .preferredColorScheme(.dark)
+        ScrollingPanel(maxHeight: screen.maxHeight - 28) {  // 28: the panel's title bar
+            LimitsSummary(accounts: store.accounts, now: store.now,
+                size: .panel, sourceError: store.allFetchersFailing, notice: store.configurationWarning,
+                onSetUp: onSetUp, onFix: onFix, hideEmails: store.hideEmails)
+                .padding(18)
+        }
+        .frame(width: 380)
+        .background(Palette.background)
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -342,6 +465,7 @@ struct Dashboard: View {
 struct PopoverRoot: View {
     let store: QuotaStore
     let usage: UsageMonitor
+    let screen: ScreenLimits
     let onHeight: (CGFloat) -> Void
     var onSetUp: (() -> Void)? = nil
     var onFix: ((String) -> Void)? = nil
@@ -354,17 +478,18 @@ struct PopoverRoot: View {
                        notice: store.configurationWarning,
                        usage: usage.days, prices: usage.priceBook.prices, pricesAsOf: usage.priceBook.asOf,
                        firstScanRunning: usage.scanning && usage.lastScan == nil, lastScan: usage.lastScan,
-                       history: store.history.recent, codexPlan: codexPlanLabel(store.codexMeta), onHeight: onHeight,
+                       history: store.history.recent, codexPlan: nil, hideEmails: store.hideEmails,
+                       maxHeight: screen.maxHeight, onHeight: onHeight,
                        onSetUp: onSetUp, onFix: onFix)
     }
 }
 
-/// "Plus" or "Plus · 120 credits" ("Plus · кредиты 120"); nil when the response carried neither.
-func codexPlanLabel(_ meta: CodexMeta?) -> String? {
-    guard let meta else { return nil }
+/// "Plus" or "Plus · 120 credits" ("Plus · кредиты 120"); nil when the responses carried neither.
+/// The plan from account/read wins over the one in the rate-limit response.
+func codexPlanLabel(_ meta: CodexMeta?, account: CodexAccountInfo? = nil) -> String? {
     var parts: [String] = []
-    if let plan = meta.plan { parts.append(plan) }
-    if let credits = meta.credits {
+    if let plan = account?.plan ?? meta?.plan { parts.append(plan) }
+    if let credits = meta?.credits {
         let amount = credits < 10 ? String(format: "%.1f", credits) : String(Int(credits.rounded()))
         parts.append(L("\(amount) credits", "кредиты \(amount)"))
     }
@@ -389,6 +514,11 @@ final class LimitsPanel: NSPanel {
                                                action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private let floatingPanelItem = NSMenuItem(title: L("Floating Panel", "Плавающая панель"),
                                                action: #selector(toggleFloatingPanel), keyEquivalent: "")
+    private let hideEmailsItem = NSMenuItem(title: L("Hide Emails", "Скрыть почты"),
+                                            action: #selector(toggleHideEmails), keyEquivalent: "")
+    /// Height caps: the popover follows the menu bar it opens from, the panel its own window.
+    let popoverScreen = ScreenLimits()
+    let panelScreen = ScreenLimits()
     private let popover = NSPopover()
     private lazy var onboarding = OnboardingWindowController { [unowned self] in self.onboardingServices() }
     private let popoverWidth: CGFloat = 380
@@ -396,12 +526,12 @@ final class LimitsPanel: NSPanel {
     private var popoverClosedAt = Date.distantPast
 
     private var panelPreferred: Bool {
-        get { UserDefaults.standard.object(forKey: floatingPanelKey) as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: floatingPanelKey) }
+        get { appDefaults.object(forKey: floatingPanelKey) as? Bool ?? true }
+        set { appDefaults.set(newValue, forKey: floatingPanelKey) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let hosting = NSHostingView(rootView: Dashboard(store: store,
+        let hosting = NSHostingView(rootView: Dashboard(store: store, screen: panelScreen,
             onSetUp: { [weak self] in self?.openOnboarding() },
             onFix: { [weak self] id in self?.openOnboarding(focus: id) }))
         let size = hosting.fittingSize
@@ -419,14 +549,16 @@ final class LimitsPanel: NSPanel {
         window.isMovableByWindowBackground = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.delegate = self
-        window.setFrameAutosaveName("AILimitsPosition")
+        window.setFrameAutosaveName(panelFrameName)
         window.isReleasedWhenClosed = false
-        if !window.setFrameUsingName("AILimitsPosition"), let screen = NSScreen.main {
+        if !window.setFrameUsingName(panelFrameName), let screen = NSScreen.main {
             let bounds = screen.visibleFrame
             window.setFrameOrigin(NSPoint(x: bounds.maxX - size.width - 22, y: bounds.maxY - size.height - 22))
         }
         window.setContentSize(size)
         panel = window
+        panelScreen.screen = { [weak window] in window?.screen }
+        panelScreen.refresh()
         if panelPreferred { window.orderFrontRegardless() }
         let menu = NSMenu()
         let root = NSMenuItem()
@@ -498,6 +630,8 @@ final class LimitsPanel: NSPanel {
                 if on { showPanel() } else { panel.orderOut(nil) }
                 panelPreferred = on
             },
+            hideEmails: { [unowned self] in store.hideEmails },
+            setHideEmails: { [unowned self] on in store.hideEmails = on; updateTooltip() },
             close: { [unowned self] in onboarding.close() })
     }
 
@@ -521,8 +655,10 @@ final class LimitsPanel: NSPanel {
         updatePrices.target = self
         launchAtLoginItem.target = self
         floatingPanelItem.target = self
+        hideEmailsItem.target = self
         let quit = NSMenuItem(title: L("Quit AI Limits", "Закрыть AI Limits"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
-        statusMenu.items = [refresh, accounts, updatePrices, floatingPanelItem, launchAtLoginItem, .separator(), quit]
+        launchAtLoginItem.isHidden = appDataOverridden()
+        statusMenu.items = [refresh, accounts, updatePrices, floatingPanelItem, hideEmailsItem, launchAtLoginItem, .separator(), quit]
         statusMenu.delegate = self
         statusItem = item
     }
@@ -547,7 +683,7 @@ final class LimitsPanel: NSPanel {
     }
 
     private func setUpPopover() {
-        let root = PopoverRoot(store: store, usage: usage, onHeight: { [weak self] height in
+        let root = PopoverRoot(store: store, usage: usage, screen: popoverScreen, onHeight: { [weak self] height in
             // Resizing from inside a SwiftUI layout pass is not allowed; the next turn is soon enough.
             DispatchQueue.main.async { self?.setPopoverHeight(height) }
         }, onSetUp: { [weak self] in self?.openOnboarding() },
@@ -573,6 +709,9 @@ final class LimitsPanel: NSPanel {
         // The mouse-down that closed a transient popover also arrives here as a click.
         if Date().timeIntervalSince(popoverClosedAt) < 0.35 { return }
         guard let button = statusItem?.button else { return }
+        // Cap the height by the screen whose menu bar was clicked, not the main one.
+        popoverScreen.screen = { [weak button] in button?.window?.screen }
+        popoverScreen.refresh()
         store.tick()
         usage.requestScan()
         NSApp.activate(ignoringOtherApps: true)
@@ -605,8 +744,14 @@ final class LimitsPanel: NSPanel {
         }
     }
 
+    @objc private func toggleHideEmails() {
+        store.hideEmails.toggle()
+        updateTooltip()
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         floatingPanelItem.state = panel?.isVisible == true ? .on : .off
+        hideEmailsItem.state = store.hideEmails ? .on : .off
         switch SMAppService.mainApp.status {
         case .enabled: launchAtLoginItem.state = .on
         case .requiresApproval: launchAtLoginItem.state = .mixed
@@ -623,6 +768,8 @@ final class LimitsPanel: NSPanel {
 
     /// Registers or removes the login item; a pending approval opens System Settings instead.
     private func setLaunchAtLogin(_ on: Bool) {
+        // A test run with AI_LIMITS_DATA_DIR never registers or removes the real login item.
+        guard !appDataOverridden() else { return }
         let service = SMAppService.mainApp
         do {
             switch (service.status, on) {
@@ -641,7 +788,12 @@ final class LimitsPanel: NSPanel {
     }
 
     private func updateTooltip() {
-        statusItem?.button?.toolTip = remainingSummary(store.accounts)
+        statusItem?.button?.toolTip = remainingSummary(store.accounts, hideEmails: store.hideEmails)
+    }
+
+    /// The panel was dragged to another display: cap it by that display's height.
+    func windowDidChangeScreen(_ notification: Notification) {
+        if (notification.object as? NSWindow) === panel { panelScreen.refresh() }
     }
 
     // Closing the panel keeps the quota publisher alive for WidgetKit.
@@ -774,9 +926,12 @@ private let legacySlots = [AccountSlot(id: "codex", kind: .codex, name: "Codex")
     }
 
     // Model windows and billing anchors survive the publish round trip; only fixed keys are published.
+    // Login emails and plans reach the rows (host UI) but never the published file.
     let enriched = rows(for: legacySlots, usages: ["codex": codexWeekly, "claude-1": reading.usage],
-                        extras: ["claude-1": AccountExtras(models: reading.models, billingAnchor: "2026-10-28T20:00:00.000000Z"),
-                                 "codex": AccountExtras(billingAnchor: "2026-08-13")])
+                        extras: ["claude-1": AccountExtras(models: reading.models, billingAnchor: "2026-10-28T20:00:00.000000Z",
+                                                           email: "someone@example.com", plan: "Claude Max"),
+                                 "codex": AccountExtras(billingAnchor: "2026-08-13", email: "other@example.org", plan: "Pro")])
+    try expect(enriched[1].email == "someone@example.com" && enriched[0].plan == "Pro" && enriched[2].email == nil, 68)
     let published = try JSONEncoder().encode(PublishedSnapshot(rows: enriched))
     let text = String(decoding: published, as: UTF8.self)
     let roundTrip = try JSONDecoder().decode(PublishedSnapshot.self, from: published).displayRows
@@ -787,22 +942,27 @@ private let legacySlots = [AccountSlot(id: "codex", kind: .codex, name: "Codex")
                && roundTrip[1].models[0].quota.resetsAt == "2026-11-09T23:59:00Z", 61)
     try expect(roundTrip[0].billingAnchor == "2026-08-13" && roundTrip[2].models.isEmpty
                && roundTrip[2].billingAnchor == nil && roundTrip[2].usage == nil, 62)
-    try expect(!text.contains("@") && !text.contains("label") && !text.contains("limitId"), 63)
+    try expect(!text.contains("@") && !text.contains("label") && !text.contains("limitId")
+               && !text.contains("example") && !text.contains("Claude Max") && !text.contains("\"Pro\""), 63)
     let legacy = #"{"accounts":[{"id":"codex","name":"Codex","usage":null},{"id":"claude-1","name":"Claude 1","usage":null},{"id":"claude-2","name":"Claude 2","usage":null}]}"#
     let legacyRows = try JSONDecoder().decode(PublishedSnapshot.self, from: Data(legacy.utf8)).displayRows
     try expect(legacyRows.allSatisfy { $0.models.isEmpty && $0.billingAnchor == nil }
                && legacyRows.map(\.kind) == [.codex, .claude, .claude], 64)
-    // Any 0-4 accounts with valid unique ids are a usable snapshot; anything else falls back.
+    // Any 0-8 accounts with valid unique ids are a usable snapshot (older 4-account files too);
+    // anything else falls back.
     func snapshot(_ ids: [String]) -> PublishedSnapshot {
         PublishedSnapshot(rows: rows(for: ids.map { AccountSlot(id: $0, kind: .claude, name: $0) }, usages: nil))
     }
     try expect(snapshot([]).isValid && snapshot(["work"]).isValid && snapshot(["a", "b", "c", "d"]).isValid
-               && !snapshot(["a", "b", "c", "d", "e"]).isValid && !snapshot(["a", "a"]).isValid
+               && snapshot((1...8).map { "c\($0)" }).isValid
+               && !snapshot((1...9).map { "c\($0)" }).isValid && !snapshot(["a", "a"]).isValid
                && !snapshot(["someone@example.com"]).isValid, 66)
-    try expect(withLanguage(.ru) { remainingSummary(enriched) }.contains("Claude 1: сеанс 100%, неделя 1%")
+    try expect(withLanguage(.ru) { remainingSummary(enriched) }.contains("Claude 1 (someone@example.com): сеанс 100%, неделя 1%")
                && withLanguage(.ru) { remainingSummary(enriched) }.contains("Claude 2: нет данных"), 65)
-    try expect(withLanguage(.en) { remainingSummary(enriched) }.contains("Claude 1: session 100%, week 1%")
-               && withLanguage(.en) { remainingSummary(enriched) }.contains("Claude 2: no data"), 67)
+    try expect(withLanguage(.en) { remainingSummary(enriched) }.contains("Claude 1 (someone@example.com): session 100%, week 1%")
+               && withLanguage(.en) { remainingSummary(enriched) }.contains("Claude 2: no data")
+               && withLanguage(.en) { remainingSummary(enriched, hideEmails: true) }.contains("Claude 1 (s•••@example.com): session")
+               && !withLanguage(.en) { remainingSummary(enriched, hideEmails: true) }.contains("someone"), 67)
 
     // Monthly payment estimate in Asia/Tashkent.
     var calendar = Calendar(identifier: .gregorian)
@@ -830,8 +990,167 @@ private let legacySlots = [AccountSlot(id: "codex", kind: .codex, name: "Codex")
     // accounts.json problems are matched as English text; the Russian wording is checked in 330.
     try withLanguage(.en) { try runAccountsSelfTest() }
     try runFetchFailureSelfTest()
+    try withLanguage(.en) { try runIdentitySelfTest() }
     try runOnboardingSelfTest()
     try runAnalyticsSelfTest()
+}
+
+/// Login emails and plans (account/read, the Claude profile), masking, same-login detection,
+/// eight accounts with several Codex homes, widget layouts, the data folder, the Claude cadence.
+private func runIdentitySelfTest() throws {
+    // Codex account/read: shape verified on codex-cli 0.164.
+    let chatgpt = #"{"id":3,"result":{"account":{"type":"chatgpt","email":"Dev.Person@Example.com","planType":"pro"},"requiresOpenaiAuth":true,"extra":"x"}}"#
+    try expect(codexAccount(fromResponse: Data(chatgpt.utf8)) == CodexAccountInfo(email: "Dev.Person@Example.com", plan: "Pro"), 400)
+    for none in [#"{"id":3,"result":{"account":null,"requiresOpenaiAuth":true}}"#, #"{"id":3,"result":{}}"#,
+                 #"{"id":3,"result":{"account":{"type":"apiKey"},"requiresOpenaiAuth":false}}"#,
+                 #"{"id":3,"error":{"code":-32601,"message":"unknown method"}}"#, "garbage",
+                 #"{"id":3,"result":{"account":{"type":"chatgpt","email":"not an email","planType":"unknown"}}}"#] {
+        try expect(codexAccount(fromResponse: Data(none.utf8)) == nil, 401)
+    }
+    try expect(codexAccount(fromResponse: Data(#"{"id":3,"result":{"account":{"type":"chatgpt","planType":"plus"}}}"#.utf8))
+               == CodexAccountInfo(email: nil, plan: "Plus"), 402)
+    try expect(["pro", "plus", "team", "business", "enterprise", "edu", "PRO", "free_workspace", "go"].map { codexPlanName($0) }
+               == ["Pro", "Plus", "Team", "Business", "Enterprise", "Edu", "Pro", "Free Workspace", "Go"]
+               && codexPlanName("unknown") == nil && codexPlanName("two words") == nil && codexPlanName("") == nil, 403)
+    try expect(codexPlanLabel(CodexMeta(plan: "Plus"), account: CodexAccountInfo(email: nil, plan: "Pro")) == "Pro"
+               && codexPlanLabel(CodexMeta(plan: "Plus"), account: nil) == "Plus"
+               && codexPlanLabel(nil, account: CodexAccountInfo(email: "a@b.c", plan: nil)) == nil
+               && codexPlanLabel(nil, account: CodexAccountInfo(email: nil, plan: "Team")) == "Team", 404)
+    // Claude profile: only subscriptionCreatedAt, emailAddress and planDisplayName are taken.
+    let profile = claudeProfile(fromStateData: Data(#"{"oauthAccount":{"emailAddress":"alex@example.com","planDisplayName":"Claude Max","subscriptionCreatedAt":"2026-10-28T20:00:00Z","accountUuid":"secret","organizationName":"Org"},"projects":{}}"#.utf8))
+    try expect(profile == ClaudeProfile(anchor: "2026-10-28T20:00:00Z", email: "alex@example.com", plan: "Claude Max"), 405)
+    try expect(claudeProfile(fromStateData: Data(#"{"oauthAccount":{"emailAddress":"line\nbreak@x.io","planDisplayName":"\#(String(repeating: "x", count: 50))","subscriptionCreatedAt":"bad"}}"#.utf8)) == ClaudeProfile()
+               && claudeProfile(fromStateData: Data("{}".utf8)) == ClaudeProfile()
+               && claudeProfile(fromStateData: Data("nope".utf8)) == nil
+               && claudeProfile(fromStateData: Data(#"{"oauthAccou"#.utf8)) == nil, 406)
+    // An unreadable state file keeps the last profile; a parsed signed-out one clears it.
+    let known = ClaudeProfile(anchor: "2026-10-28T20:00:00Z", email: "alex@example.com", plan: "Claude Max")
+    try expect(mergedClaudeProfile(previous: known, read: nil) == known
+               && mergedClaudeProfile(previous: known, read: ClaudeProfile()) == ClaudeProfile()
+               && mergedClaudeProfile(previous: nil, read: nil) == nil, 420)
+    // Masking and the "plan · email" line.
+    try expect(maskedEmail("alex@example.com") == "a•••@example.com" && maskedEmail("x@y.z") == "x•••@y.z"
+               && maskedEmail("plain") == "p•••" && maskedEmail("@odd") == "@•••" && maskedEmail("") == "", 407)
+    try expect(identityLine(plan: "Max", email: "alex@example.com", hideEmails: false) == "Max · alex@example.com"
+               && identityLine(plan: "Max", email: "alex@example.com", hideEmails: true) == "Max · a•••@example.com"
+               && identityLine(plan: nil, email: "a@b.co", hideEmails: false) == "a@b.co"
+               && identityLine(plan: "Pro", email: nil, hideEmails: true) == "Pro"
+               && identityLine(plan: nil, email: nil, hideEmails: false) == nil, 408)
+    try expect(sanitizedEmail("  a@b.co ") == "a@b.co" && sanitizedEmail("a@") == nil && sanitizedEmail("@b") == nil
+               && sanitizedEmail("a b@c.d") == nil && sanitizedEmail(42) == nil, 409)
+    // Same login: same type and email (any case); another type with the same email is fine.
+    // All dedicated folders: the first keeps the login, the later ones are asked to sign in again.
+    let logins: [(id: String, kind: AccountKind, email: String?, dedicated: Bool)] = [
+        ("claude-1", .claude, "Alex@Example.com", true), ("codex", .codex, "alex@example.com", true),
+        ("claude-2", .claude, "alex@example.COM", true), ("claude-3", .claude, nil, true),
+        ("claude-4", .claude, "sam@example.org", true), ("codex-2", .codex, "alex@example.com", true),
+        ("claude-5", .claude, "alex@example.com", true)]
+    try expect(sameLoginPairs(logins) == [SameLoginPair(earlier: "claude-1", later: "claude-2"),
+                                          SameLoginPair(earlier: "codex", later: "codex-2"),
+                                          SameLoginPair(earlier: "claude-1", later: "claude-5")]
+               && sameLoginPairs([(id: "a", kind: .claude, email: nil, dedicated: true),
+                                  (id: "b", kind: .claude, email: nil, dedicated: false)]).isEmpty, 410)
+    // The default login (no dedicated folder) is never the one asked to sign in again, even listed later.
+    try expect(sameLoginPairs([(id: "claude-1", kind: .claude, email: "alex@example.com", dedicated: true),
+                               (id: "claude-2", kind: .claude, email: "Alex@example.com", dedicated: false),
+                               (id: "claude-3", kind: .claude, email: "alex@example.com", dedicated: true),
+                               (id: "codex-2", kind: .codex, email: "team@example.net", dedicated: true),
+                               (id: "codex", kind: .codex, email: "team@example.net", dedicated: false)])
+               == [SameLoginPair(earlier: "claude-2", later: "claude-1"),
+                   SameLoginPair(earlier: "claude-2", later: "claude-3"),
+                   SameLoginPair(earlier: "codex", later: "codex-2")]
+               && sameLoginPairs([(id: "claude-1", kind: .claude, email: "alex@example.com", dedicated: false),
+                                  (id: "claude-2", kind: .claude, email: "alex@example.com", dedicated: true)])
+               == [SameLoginPair(earlier: "claude-1", later: "claude-2")], 428)
+    // The panel skips a pair whose later account is failing (its card shows the failure instead).
+    let sameRows = [AccountRow(id: "claude-1", name: "Claude 1", kind: .claude, usage: nil, email: "alex@example.com", dedicated: true),
+                    AccountRow(id: "claude-2", name: "Claude 2", kind: .claude, usage: nil, failure: .failed, email: "alex@example.com", dedicated: true),
+                    AccountRow(id: "claude-3", name: "Claude 3", kind: .claude, usage: nil, email: "ALEX@example.com", dedicated: true)]
+    try expect(sameLoginPairs(sameRows) == [SameLoginPair(earlier: "claude-1", later: "claude-3")], 427)
+    // A default-login row listed after a dedicated one keeps the login; the dedicated row gets the warning.
+    let defaultLater = [AccountRow(id: "claude-2", name: "Claude 2", kind: .claude, usage: nil, email: "alex@example.com", dedicated: true),
+                        AccountRow(id: "claude-1", name: "Claude 1", kind: .claude, usage: nil, email: "alex@example.com")]
+    try expect(sameLoginPairs(defaultLater) == [SameLoginPair(earlier: "claude-1", later: "claude-2")]
+               && rows(for: [AccountSlot(id: "claude-2", kind: .claude, name: "Claude 2")], usages: nil,
+                       extras: ["claude-2": AccountExtras(email: "alex@example.com", dedicated: true)])[0].dedicated, 429)
+    try expect(sameLoginTitle("Claude 1", "Claude 2") == "Claude 1 and Claude 2 are the same login"
+               && withLanguage(.ru) { sameLoginTitle("Claude 1", "Claude 2") } == "Claude 1 и Claude 2 — один и тот же вход"
+               && sameLoginHint("Claude 2", kind: .claude).contains("/login")
+               && withLanguage(.ru) { sameLoginHint("Codex 2", kind: .codex) }.contains("codex login"), 411)
+
+    // Eight accounts, two Codex logins with different homes; a second default-home Codex is refused.
+    let home = URL(fileURLWithPath: "/Users/tester")
+    func resolve(_ text: String) -> AccountsConfiguration {
+        resolveAccounts(fileData: Data(text.utf8), home: home, isExecutable: { _ in false }) { _, _ in nil }
+    }
+    let eight = resolve(#"""
+    {"accounts":[{"id":"codex","type":"codex"},{"id":"codex-2","type":"codex","home":"~/.codex-work"},
+                 \#((1...6).map { #"{"id":"claude-\#($0)","type":"claude","configDir":"~/.claude-\#($0)"}"# }.joined(separator: ",")),
+                 {"id":"codex-3","type":"codex"},{"id":"codex-4","type":"codex","home":"~/.codex-work/"},
+                 {"id":"codex-5","type":"codex","home":"~/.codex"}]}
+    """#)
+    try expect(eight.ids == ["codex", "codex-2"] + (1...6).map { "claude-\($0)" }
+               && eight.codexAccounts.map(\.directory) == [nil, "/Users/tester/.codex-work"]
+               && eight.accounts.map(\.name).prefix(3) == ["Codex 1", "Codex 2", "Claude 1"]
+               && eight.warning?.contains("entry 9: only one codex account can use the default home") == true
+               && eight.warning?.contains("and 1 more") == true, 412)
+    let homes = resolve(#"{"accounts":[{"id":"cx","type":"codex","home":"~/.codex-a"},{"id":"cy","type":"codex","home":"~/.codex-a"},{"id":"cz","type":"codex","home":"~/.codex"},{"id":"cw","type":"codex"}]}"#)
+    try expect(homes.ids == ["cx", "cz"] && homes.warning?.contains("another codex account already uses this home") == true
+               && homes.warning?.contains("default home") == true, 413)
+    try expect(nextCodexID(existing: []) == "codex" && nextCodexID(existing: ["codex"]) == "codex-2"
+               && nextCodexID(existing: ["codex", "codex-2", "codex-4"]) == "codex-3"
+               && nextAccountID(kind: .claude, existing: ["claude-1"]) == "claude-2", 414)
+    try expect(suggestedLoginFolder(kind: .codex, name: "Work", home: home, taken: [], exists: { _ in false }) == "~/.codex-work"
+               && suggestedLoginFolder(kind: .codex, name: "", home: home, taken: ["/Users/tester/.codex-account"], exists: { _ in false }) == "~/.codex-account-2"
+               && suggestedName(forFolder: "/Users/tester/.codex-work", kind: .codex) == "Codex Work"
+               && suggestedName(forFolder: "/Users/tester/.codex2", kind: .codex) == "Codex 2", 415)
+
+    // Widget layouts: blocks up to 4 accounts, a list above; medium columns up to 4, a 2-column grid above.
+    try expect((0...4).allSatisfy { !largeWidgetUsesList(accountCount: $0) } && (5...8).allSatisfy { largeWidgetUsesList(accountCount: $0) }
+               && (0...4).allSatisfy { !mediumWidgetUsesGrid(accountCount: $0) } && (5...8).allSatisfy { mediumWidgetUsesGrid(accountCount: $0) }, 416)
+
+    // Data folder: AI_LIMITS_DATA_DIR (absolute or ~/) wins; empty means unset; anything else refuses to start.
+    try expect(appDataDirectory(environment: [:], home: home)?.path == "/Users/tester/Library/Application Support/AILimits"
+               && appDataDirectory(environment: ["AI_LIMITS_DATA_DIR": "/tmp/ai-limits-test"], home: home)?.path == "/tmp/ai-limits-test"
+               && appDataDirectory(environment: ["AI_LIMITS_DATA_DIR": "~/test-data"], home: home)?.path == "/Users/tester/test-data"
+               && appDataDirectory(environment: ["AI_LIMITS_DATA_DIR": "relative"], home: home) == nil
+               && appDataDirectory(environment: ["AI_LIMITS_DATA_DIR": "tmp/ail"], home: home) == nil
+               && appDataDirectory(environment: ["AI_LIMITS_DATA_DIR": ""], home: home)?.path.hasSuffix("Application Support/AILimits") == true, 417)
+    // A test run gets its own preferences domain, stable per folder and different between folders.
+    try expect(appDataOverridden(environment: ["AI_LIMITS_DATA_DIR": "/tmp/a"]) && !appDataOverridden(environment: [:])
+               && !appDataOverridden(environment: ["AI_LIMITS_DATA_DIR": ""])
+               && preferencesSuiteName(forDataFolder: URL(fileURLWithPath: "/tmp/a"))
+                    == preferencesSuiteName(forDataFolder: URL(fileURLWithPath: "/tmp/a/"))
+               && preferencesSuiteName(forDataFolder: URL(fileURLWithPath: "/tmp/a"))
+                    != preferencesSuiteName(forDataFolder: URL(fileURLWithPath: "/tmp/b"))
+               && preferencesSuiteName(forDataFolder: URL(fileURLWithPath: "/tmp/a")).hasPrefix("local.ai-limits.test-"), 421)
+    // The running self-test resolves every file of the app inside that folder.
+    for url in [accountsURL, billingURL, historyURL, pricesURL, onboardingScriptsFolder, hostSnapshotURL] {
+        try expect(url.path.hasPrefix(appDataFolder.path + "/"), 418)
+    }
+    // A result is kept only while its id, type and folder still match (a renamed card keeps it; a reused id does not).
+    let oldLogin = AccountConfig(id: "claude-2", kind: .claude, name: "Claude 2", directory: "/Users/tester/.claude-a")
+    try expect(oldLogin.sameFolder(as: AccountConfig(id: "claude-2", kind: .claude, name: "Renamed", directory: "/Users/tester/.claude-a"))
+               && !oldLogin.sameFolder(as: AccountConfig(id: "claude-2", kind: .claude, name: "Claude 2", directory: "/Users/tester/.claude-b"))
+               && !oldLogin.sameFolder(as: AccountConfig(id: "claude-2", kind: .codex, name: "Claude 2", directory: "/Users/tester/.claude-a"))
+               && !oldLogin.sameFolder(as: AccountConfig(id: "claude-3", kind: .claude, name: "Claude 2", directory: "/Users/tester/.claude-a")), 422)
+    // A /usage read without limits is "not signed in" only after a timely repaint; else a plain failure.
+    try expect(claudeMissingUsageReason(repaintBytes: 4_000, readSeconds: 5.2) == .notLoggedIn
+               && claudeMissingUsageReason(repaintBytes: 0, readSeconds: 5) == .failed
+               && claudeMissingUsageReason(repaintBytes: 4_000, readSeconds: 600) == .failed, 425)
+    // Height cap per screen: a 900 pt laptop screen caps at 840 pt, a 1440 pt display at 1380 pt.
+    try expect(cappedHeight(visibleHeight: 900) == 840 && cappedHeight(visibleHeight: 1440) == 1380
+               && cappedHeight(visibleHeight: 300) == 320 && cappedHeight(visibleHeight: nil) == 740, 426)
+    // Claude cadence: 2 minutes up to 6 accounts, stretched so 8 sequential ~15 s checks leave a gap.
+    try expect(claudeCheckInterval(accountCount: 1) == 120 && claudeCheckInterval(accountCount: 6) == 120
+               && claudeCheckInterval(accountCount: 7) == 135 && claudeCheckInterval(accountCount: 8) == 150
+               && claudeCheckInterval(accountCount: 8) > 8 * 15, 419)
+    // Codex checks: at most two at a time; the rest wait in list order for a free slot.
+    try expect(codexChecksToStart(due: ["codex", "codex-2", "codex-3", "codex-4"], running: 0) == ["codex", "codex-2"]
+               && codexChecksToStart(due: ["codex-3", "codex-4"], running: 1) == ["codex-3"]
+               && codexChecksToStart(due: ["codex-3"], running: 2).isEmpty
+               && codexChecksToStart(due: ["codex-3"], running: 3).isEmpty
+               && codexChecksToStart(due: [], running: 0).isEmpty && maxConcurrentCodexChecks == 2, 430)
 }
 
 /// accounts.json writer, login discovery, Terminal scripts and names, on a temporary fake home.
@@ -891,6 +1210,13 @@ private func runOnboardingSelfTest() throws {
     try makeFolder(".config", withState: true)
     try Data("{}".utf8).write(to: home.appendingPathComponent(".claude.json"))
     try Data("{}".utf8).write(to: home.appendingPathComponent(".claudefile"))
+    // Codex: .codex* folders (not .codex) with an auth.json; only its existence is checked.
+    for (name, auth) in [(".codex", true), (".codex-work", true), (".codex-empty", false), (".codexalt", true)] {
+        let folder = home.appendingPathComponent(name)
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        if auth { try Data().write(to: folder.appendingPathComponent("auth.json")) }
+    }
+    try expect(discoverCodexLogins(home: home).map { ($0 as NSString).lastPathComponent } == [".codex-work", ".codexalt"], 365)
     let found = discoverClaudeLogins(home: home).map { ($0 as NSString).lastPathComponent }
     try expect(found == [".claude-alt", ".claude-work", ".claude2"]
                && discoverClaudeLogins(home: home, limit: 2).count == 2
@@ -911,11 +1237,22 @@ private func runOnboardingSelfTest() throws {
                && lines.last == "exec '/Users/x/My Tools/it'\\''s/claude'"
                && !trust.contains(" | ") && !trust.contains("<<") && lines.contains { $0.hasPrefix("printf '%s\\n' 'AI Limits: Claude Code will ask") }, 355)
     let login = terminalScript(task: .claudeLogin, cli: "/opt/c/claude", directory: nil, probeFolder: probe, home: home)
-    let codex = terminalScript(task: .codexLogin, cli: "/opt/c/codex", directory: "/Users/x/codex home", probeFolder: probe, home: home)
+    let codex = terminalScript(task: .codexLogin, cli: "/opt/c/codex", directory: "/Users/x/codex home", probeFolder: probe, home: home,
+                               defaultCodexHome: "/elsewhere")
     try expect(!login.contains("CLAUDE_CONFIG_DIR=") && login.hasSuffix("exec '/opt/c/claude'\n")
                && withLanguage(.ru) { terminalScript(task: .claudeLogin, cli: "/opt/c/claude", directory: nil, probeFolder: probe, home: home) }.contains("/login")
                && codex.contains("export CODEX_HOME='/Users/x/codex home'") && codex.hasSuffix("exec '/opt/c/codex' login\n")
                && !codex.contains("unset -m") && codex.contains("cd '\(home.path)' || exit 1"), 356)
+    // The default Codex login never follows a CODEX_HOME from the user's shell profile; it gets
+    // exactly what the app's own check inherits.
+    let defaultCodex = terminalScript(task: .codexLogin, cli: "/opt/c/codex", directory: nil, probeFolder: probe, home: home,
+                                      defaultCodexHome: nil)
+    let inheritedCodex = terminalScript(task: .codexLogin, cli: "/opt/c/codex", directory: nil, probeFolder: probe, home: home,
+                                        defaultCodexHome: "/Users/x/gui-codex")
+    try expect(defaultCodex.contains("\nunset CODEX_HOME\n") && !defaultCodex.contains("export CODEX_HOME")
+               && inheritedCodex.contains("export CODEX_HOME='/Users/x/gui-codex'") && !inheritedCodex.contains("unset CODEX_HOME")
+               && inheritedCodexHome(environment: [:], home: home) == nil
+               && inheritedCodexHome(environment: ["CODEX_HOME": "~/c"], home: URL(fileURLWithPath: "/Users/x")) == "/Users/x/c", 423)
     // The quoting survives a real shell: the shell prints back exactly the original text.
     for text in [cli, "a 'b' \"c\" $HOME `x` \\ ; & é", ""] {
         let shell = Process()
@@ -935,12 +1272,30 @@ private func runOnboardingSelfTest() throws {
     // Copy commands: "~/" stays outside the quotes so the shell expands it.
     let fakeHome = URL(fileURLWithPath: "/Users/you")
     try expect(terminalCommand(task: .claudeTrust, directory: "/Users/you/.claude-work",
-                               probeFolder: "/Users/you/Library/Application Support/AILimits/ClaudeProbe", home: fakeHome)
-               == "cd ~/'Library/Application Support/AILimits/ClaudeProbe' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR=~/'.claude-work' claude"
-               && terminalCommand(task: .claudeLogin, directory: nil, probeFolder: "/tmp/p q", home: fakeHome) == "cd '/tmp/p q' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude"
-               && terminalCommand(task: .codexLogin, directory: nil, probeFolder: "/tmp", home: fakeHome) == "codex login"
-               && terminalCommand(task: .codexLogin, directory: "/Users/you/it's", probeFolder: "/tmp", home: fakeHome)
+                               probeFolder: "/Users/you/Library/Application Support/AILimits/ClaudeProbe", home: fakeHome, defaultCodexHome: nil)
+               == "cd ~/'Library/Application Support/AILimits/ClaudeProbe' && CLAUDE_CONFIG_DIR=~/'.claude-work' env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude"
+               && terminalCommand(task: .claudeLogin, directory: nil, probeFolder: "/tmp/p q", home: fakeHome, defaultCodexHome: nil)
+                  == "cd '/tmp/p q' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CONFIG_DIR claude"
+               && terminalCommand(task: .codexLogin, directory: nil, probeFolder: "/tmp", home: fakeHome, defaultCodexHome: nil) == "env -u CODEX_HOME codex login"
+               && terminalCommand(task: .codexLogin, directory: nil, probeFolder: "/tmp", home: fakeHome, defaultCodexHome: "/Users/you/.codex")
+                  == "CODEX_HOME=~/'.codex' codex login"
+               && terminalCommand(task: .codexLogin, directory: "/Users/you/it's", probeFolder: "/tmp", home: fakeHome, defaultCodexHome: nil)
                   == "CODEX_HOME=~/'it'\\''s' codex login", 359)
+    // The copied commands expand "~" in zsh (a prefix assignment, not an argument to env).
+    for (command, expected) in [("CLAUDE_CONFIG_DIR=~/'.claude-work' env -u ANTHROPIC_API_KEY printenv CLAUDE_CONFIG_DIR", "/.claude-work"),
+                                ("CLAUDE_CONFIG_DIR=x env -u CLAUDE_CONFIG_DIR printenv CLAUDE_CONFIG_DIR || echo unset", "unset")] {
+        let shell = Process()
+        shell.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        shell.arguments = ["-f", "-c", command]
+        let output = Pipe()
+        shell.standardOutput = output
+        shell.standardInput = FileHandle.nullDevice
+        try shell.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        shell.waitUntilExit()
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        try expect(text.hasSuffix(expected) && !text.hasPrefix("~"), 424)
+    }
 
     // Names, slugs and ids.
     try expect(accountSlug("Work") == "work" && accountSlug("Claude Work 2") == "claude-work-2"
@@ -1073,7 +1428,7 @@ private func runAccountsSelfTest() throws {
                && valid.accounts.map(\.name) == ["Codex", "Claude", "Claude Work"]
                && valid.accounts[0].directory == nil && valid.accounts[1].directory == nil
                && valid.accounts[2].directory == "/Users/tester/.claude-work"
-               && valid.cli == ["claude": "/opt/tools/claude"] && valid.codex?.id == "codex", 300)
+               && valid.cli == ["claude": "/opt/tools/claude"] && valid.codexAccounts.map(\.id) == ["codex"], 300)
 
     // Default names: one Claude is "Claude", several are numbered in order; Codex home is kept.
     let one = resolve(#"{"accounts":[{"id":"main","type":"claude"},{"id":"cx","type":"codex","home":"/opt/codex-home"}]}"#)
@@ -1089,10 +1444,10 @@ private func runAccountsSelfTest() throws {
     try expect(badIDs.ids == ["ok"] && badIDs.warning?.hasPrefix("accounts.json: entry 1") == true
                && badIDs.warning?.contains("and 3 more") == true && !(badIDs.warning?.contains("a@b") ?? true), 304)
     let twoCodex = resolve(#"{"accounts":[{"id":"codex","type":"codex"},{"id":"codex-2","type":"codex"},{"id":"x","type":"gemini"},"nope"]}"#)
-    try expect(twoCodex.ids == ["codex"] && twoCodex.warning?.contains("only one codex") == true, 305)
-    let many = resolve(#"{"accounts":[\#((1...6).map { #"{"id":"c\#($0)","type":"claude"}"# }.joined(separator: ","))]}"#)
-    try expect(many.ids == ["c1", "c2", "c3", "c4"] && many.accounts.last?.name == "Claude 4"
-               && many.warning?.contains("first 4") == true, 306)
+    try expect(twoCodex.ids == ["codex"] && twoCodex.warning?.contains("only one codex account can use the default home") == true, 305)
+    let many = resolve(#"{"accounts":[\#((1...10).map { #"{"id":"c\#($0)","type":"claude"}"# }.joined(separator: ","))]}"#)
+    try expect(many.ids == (1...8).map { "c\($0)" } && many.accounts.last?.name == "Claude 8"
+               && many.warning?.contains("first 8") == true, 306)
     let badPaths = resolve(#"{"accounts":[{"id":"a","type":"claude","configDir":"relative/dir"},{"id":"b","type":"claude"}],"cli":{"codex":"/nowhere/codex"}}"#)
     try expect(badPaths.ids == ["b"] && badPaths.cli.isEmpty && badPaths.warning?.contains("absolute") == true
                && badPaths.warning?.contains("cli.codex") == true, 307)
@@ -1120,6 +1475,13 @@ private func runAccountsSelfTest() throws {
     let plain = UsageSources(configuration: detected, home: home, environment: [:])
     try expect(plain.claudeRoots.map(\.path) == ["/Users/tester/.claude/projects"]
                && plain.codexRoots.map(\.path) == ["/Users/tester/.codex/sessions"], 321)
+    // Several Codex homes: one sessions root each, a shared folder counted once.
+    let codexHomes = UsageSources(configuration: resolve(#"""
+    {"accounts":[{"id":"codex","type":"codex"},{"id":"codex-2","type":"codex","home":"~/.codex-work"},
+                 {"id":"codex-3","type":"codex","home":"~/.codex-team"}]}
+    """#), home: home, environment: [:])
+    try expect(codexHomes.codexRoots.map(\.path) == ["/Users/tester/.codex/sessions", "/Users/tester/.codex-work/sessions",
+                                                      "/Users/tester/.codex-team/sessions"], 324)
     let explicit = UsageSources(configuration: one, home: home, environment: ["CODEX_HOME": "/elsewhere"])
     try expect(explicit.codexRoots.map(\.path) == ["/opt/codex-home/sessions"]
                && UsageSources(configuration: AccountsConfiguration(), home: home) == UsageSources(claudeRoots: [], codexRoots: []), 322)
@@ -1552,6 +1914,8 @@ private func runCheck() -> Bool {
 
 @main struct Launch {
     @MainActor static func main() {
+        // A mistyped AI_LIMITS_DATA_DIR must not fall back to the real data folder.
+        if appDataDirectory() == nil { fputs(dataDirectoryError, stderr); exit(64) }
         if let index = CommandLine.arguments.firstIndex(of: "--launch-at-login") {
             let command = CommandLine.arguments.dropFirst(index + 1).first ?? "status"
             let service = SMAppService.mainApp
@@ -1585,7 +1949,8 @@ private func runCheck() -> Bool {
                 print("PASS: unavailable account is isolated; missing quota stays unknown; real zero remains zero; original timestamp preserves stale state; UI language choice, Russian plurals, en/ru captions.")
                 print("PASS: Claude /usage parser handles escapes, glued words, missing minutes/Resets, year rollover; trust prompt and empty output are errors.")
                 print("PASS: Codex windows classified by duration; model windows and payment anchors survive publishing; payment dates recur monthly.")
-                print("PASS: accounts.json parsed (defaults, duplicate/bad ids, one codex, at most 4, bad paths, unparseable -> warning + detection); log roots derived; reset zones parsed for any IANA name; fetch failures map to fixed en/ru hints; login-shell misses expire after 5 min.")
+                print("PASS: accounts.json parsed (defaults, duplicate/bad ids, several codex homes but one default, at most 8, bad paths, unparseable -> warning + detection); log roots derived per home; reset zones parsed for any IANA name; fetch failures map to fixed en/ru hints; login-shell misses expire after 5 min.")
+                print("PASS: login emails and plans from account/read and the Claude profile (api-key and missing accounts ignored), plan names, masking, same-login pairs (never the default login), emails never published; widget layouts for 5-8 accounts; AI_LIMITS_DATA_DIR; Claude cadence for 8 accounts; at most two Codex checks at a time.")
                 print("PASS: onboarding writes accounts.json keeping cli/unknown keys and ids (0600, folder 0700, broken file backed up); finds extra Claude logins by folder name and .claude.json presence only; Terminal scripts quote paths with spaces and quotes; slugs, ids and folder names.")
                 print("PASS: pace math, history sampling and pruning, price prefixes, compact numbers in English and Russian, Codex plan; usage days follow DST; log scanner dedupes, skips synthetic, joins chunk-split lines, resumes and rescans shrunk files.")
                 print("PASS: pricing pages parsed by header names (<sup>, link in parentheses, two Haiku 5.5 tiers, later fast/batch tables ignored, 4-column OpenAI table); validation rejects; layers user > downloaded > built-in; prefix lookup; 1-hour cache write cost; 24 h refresh throttle.")

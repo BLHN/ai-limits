@@ -108,7 +108,76 @@ import SwiftUI
         try render(popover(.analytics, .today), dir + "/popover-analytics-today.png")
         try render(PopoverContent(accounts: rows, now: now, usage: [:], prices: [:], firstScanRunning: true, lastScan: nil,
                                   history: [], codexPlan: nil, tab: .analytics, period: .month, animated: false), dir + "/popover-analytics-empty.png")
+        try renderMany(dir, now: now, rows: rows, usage: usage, history: history)
         try renderOnboarding(dir)
+    }
+
+    /// Six and eight accounts (several Codex logins), login emails shown and hidden, a same-login warning.
+    @MainActor static func renderMany(_ dir: String, now: Date, rows: [AccountRow], usage: UsageDays, history: [HistorySample]) throws {
+        func q(_ used: Double, _ reset: String) -> Quota { Quota(usedPercent: used, resetsAt: reset) }
+        let fresh = "2026-11-10T00:29:30Z"
+        func claude(_ id: String, _ name: String, _ session: Double, _ week: Double, email: String?, plan: String? = "Claude Max",
+                    model: Double? = nil) -> AccountRow {
+            AccountRow(id: id, name: name, kind: .claude,
+                       usage: Usage(provider: "claude", updatedAt: fresh, primary: q(session, "2026-11-10T03:34:00Z"), secondary: q(week, "2026-11-16T11:00:00Z")),
+                       models: model.map { [ModelQuota(id: "f", title: "Fable", quota: q($0, "2026-11-15T22:34:00Z"))] } ?? [],
+                       billingAnchor: "2026-10-12", email: email, plan: plan, dedicated: id != "claude-1")
+        }
+        func codex(_ id: String, _ name: String, _ week: Double, email: String?, plan: String?) -> AccountRow {
+            AccountRow(id: id, name: name, kind: .codex,
+                       usage: Usage(provider: "codex", updatedAt: fresh, primary: nil, secondary: q(week, "2026-11-11T09:34:34Z")),
+                       billingAnchor: "2026-08-15", email: email, plan: plan, dedicated: id != "codex")
+        }
+        let eight = [
+            codex("codex", "Codex", 78, email: "alex@example.com", plan: "Pro"),
+            codex("codex-2", "Codex Work", 35, email: "alex.work@example.com", plan: "Business"),
+            claude("claude-1", "Claude 1", 0, 99, email: "alex@example.com", model: 100),
+            claude("claude-2", "Claude 2", 40, 14, email: "sam@example.org", model: 38),
+            claude("claude-3", "Claude Work", 100, 55, email: "alex.work@example.com", plan: "Claude Team"),
+            claude("claude-4", "Claude 4", 12, 71, email: nil, plan: "Claude Pro"),
+            claude("claude-5", "Claude Lab", 66, 88, email: "lab.account.with.long.name@university.example.edu"),
+            AccountRow(id: "claude-6", name: "Claude Spare", kind: .claude, usage: nil, failure: .probeNotTrusted)
+        ]
+        let six = Array(eight.prefix(6))
+        // Claude 2 (its own folder) signed into the same login as Claude 1 (the default login).
+        var duplicate = six
+        duplicate[3] = claude("claude-2", "Claude 2", 40, 14, email: "Alex@Example.com", model: 38)
+
+        for (name, accounts) in [("6", six), ("8", eight)] {
+            try render(LimitsSummary(accounts: accounts, now: now, size: .medium).padding(12).frame(width: 344, height: 164), dir + "/medium-\(name).png")
+            try render(LimitsSummary(accounts: accounts, now: now, size: .large).padding(18).frame(width: 338, height: 354), dir + "/large-\(name).png")
+            try render(LimitsSummary(accounts: accounts, now: now, size: .panel, onFix: { _ in }).padding(18).frame(width: 380), dir + "/panel-\(name).png")
+            try render(PopoverContent(accounts: accounts, now: now, usage: usage, prices: builtInPrices, firstScanRunning: false,
+                                      lastScan: now, history: history, codexPlan: nil, tab: .limits, animated: false, onFix: { _ in }),
+                       dir + "/popover-limits-\(name).png")
+            try render(PopoverContent(accounts: accounts, now: now, usage: usage, prices: builtInPrices, firstScanRunning: false,
+                                      lastScan: now, history: history, codexPlan: nil, tab: .analytics, animated: false),
+                       dir + "/popover-analytics-\(name).png")
+        }
+        try render(PopoverContent(accounts: rows.map { row in
+                var copy = row
+                copy.email = row.kind == .codex ? "alex@example.com" : (row.id == "claude-1" ? "alex@example.com" : "sam@example.org")
+                copy.plan = row.kind == .codex ? "Plus" : "Claude Max"
+                copy.dedicated = row.id != "codex" && row.id != "claude-1"
+                return copy
+            }, now: now, usage: usage, prices: builtInPrices, firstScanRunning: false, lastScan: now, history: history,
+                                  codexPlan: nil, tab: .limits, animated: false), dir + "/popover-limits-emails.png")
+        try render(PopoverContent(accounts: eight, now: now, usage: usage, prices: builtInPrices, firstScanRunning: false,
+                                  lastScan: now, history: history, codexPlan: nil, hideEmails: true, tab: .limits, animated: false, onFix: { _ in }),
+                   dir + "/popover-limits-8-hidden.png")
+        // The host stopped publishing two hours ago: the grid marks every figure as delayed.
+        try render(LimitsSummary(accounts: eight, now: now.addingTimeInterval(7200), size: .medium).padding(12).frame(width: 344, height: 164),
+                   dir + "/medium-8-delayed.png")
+        try render(LimitsSummary(accounts: six, now: now, size: .panel, onFix: { _ in }, hideEmails: true).padding(18).frame(width: 380), dir + "/panel-6-hidden.png")
+        try render(PopoverContent(accounts: duplicate, now: now, usage: usage, prices: builtInPrices, firstScanRunning: false,
+                                  lastScan: now, history: history, codexPlan: nil, tab: .limits, animated: false, onFix: { _ in }),
+                   dir + "/popover-same-login.png")
+        try render(LimitsSummary(accounts: duplicate, now: now, size: .panel, onFix: { _ in }).padding(18).frame(width: 380), dir + "/panel-same-login.png")
+        // A popover capped to a short screen: the pane scrolls under the fixed tab switch (static renders cannot scroll,
+        // so this shows the first screenful).
+        try render(PopoverContent(accounts: eight, now: now, usage: usage, prices: builtInPrices, firstScanRunning: false,
+                                  lastScan: now, history: history, codexPlan: nil, tab: .limits, animated: false)
+                    .frame(height: 600, alignment: .top).clipped(), dir + "/popover-limits-8-capped.png")
     }
 
     /// The setup window's steps and card states, from fixtures (a fake home, fixed check results).
@@ -124,7 +193,7 @@ import SwiftUI
                 launchAtLogin: { .off }, setLaunchAtLogin: { _ in }, panelVisible: { true }, setPanelVisible: { _ in }, close: {})
             let model = OnboardingModel(services: services, step: step, isStatic: true, home: home, probeFolder: probe)
             model.drafts = drafts
-            model.suggestions = suggestions
+            model.suggestions = suggestions.map { LoginSuggestion(kind: .claude, path: $0) }
             model.launchAtLogin = .on
             model.panelVisible = true
             return model
@@ -165,10 +234,44 @@ import SwiftUI
         let adding = model(.accounts, [codex, claude],
                            states: ["codex": AccountCheckState(summary: connectedSummary(week41)),
                                     "claude-1": AccountCheckState(summary: connectedSummary(week83))])
-        adding.addForm = AddClaudeForm(name: L("Work", "Работа"), folder: L("~/.claude-work", "~/.claude-rabota"))
+        adding.addForm = AddLoginForm(name: L("Work", "Работа"), folder: L("~/.claude-work", "~/.claude-rabota"))
         try render(view(adding), dir + "/onboarding-add.png")
         // Nothing detected yet.
         try render(view(model(.accounts, [])), dir + "/onboarding-accounts-empty.png")
+        // Logins with emails, eight cards with reorder buttons, a duplicate login, two Codex homes.
+        let codexWork = AccountDraft(id: "codex-2", kind: .codex, name: "Codex Work", directory: "/Users/you/.codex-work")
+        let lab = AccountDraft(id: "claude-4", kind: .claude, name: "Claude Lab", directory: "/Users/you/.claude-lab")
+        let spare = AccountDraft(id: "claude-5", kind: .claude, name: "Claude Spare", directory: "/Users/you/.claude-spare")
+        let extra = AccountDraft(id: "claude-6", kind: .claude, name: "Claude 6", directory: "/Users/you/.claude-6")
+        func connected(_ usage: Usage, _ email: String?, _ plan: String?) -> AccountCheckState {
+            AccountCheckState(summary: connectedSummary(usage), email: email, plan: plan)
+        }
+        let eightStates: [String: AccountCheckState] = [
+            "codex": connected(week41, "alex@example.com", "Pro"),
+            "codex-2": connected(week41, "alex.work@example.com", "Business"),
+            "claude-1": connected(week83, "alex@example.com", "Claude Max"),
+            "claude-2": connected(week83, "Alex@Example.com", "Claude Max"),
+            "claude-3": connected(week83, "alex.work@example.com", "Claude Team"),
+            "claude-4": connected(week83, "lab.account.with.long.name@university.example.edu", "Claude Max"),
+            "claude-5": AccountCheckState(checking: true, waiting: true),
+            "claude-6": AccountCheckState(failure: .notLoggedIn)]
+        let eightDrafts = [codex, codexWork, claude, work, team, lab, spare, extra]
+        try render(view(model(.accounts, eightDrafts, states: eightStates, suggestions: [])), dir + "/onboarding-accounts-8.png")
+        let hidden = model(.accounts, eightDrafts, states: eightStates)
+        hidden.staticHideEmails = true
+        try render(view(hidden), dir + "/onboarding-accounts-8-hidden.png")
+        let twoCodex = model(.accounts, [codex, claude],
+                             states: ["codex": connected(week41, "alex@example.com", "Pro"),
+                                      "claude-1": connected(week83, "alex@example.com", "Claude Max")],
+                             suggestions: [])
+        twoCodex.suggestions = [LoginSuggestion(kind: .codex, path: "/Users/you/.codex-old"), LoginSuggestion(kind: .claude, path: "/Users/you/.claude-alt")]
+        twoCodex.addForm = AddLoginForm(kind: .codex, name: L("Work", "Работа"), folder: L("~/.codex-work", "~/.codex-rabota"))
+        try render(view(twoCodex), dir + "/onboarding-add-codex.png")
+        let same = model(.accounts, [codex, claude, work],
+                         states: ["codex": connected(week41, "alex@example.com", "Pro"),
+                                  "claude-1": connected(week83, "alex@example.com", "Claude Max"),
+                                  "claude-2": connected(week83, "alex@example.com", "Claude Max")])
+        try render(view(same), dir + "/onboarding-same-login.png")
         try render(view(model(.finish, [codex, claude, work],
                               states: ["codex": AccountCheckState(summary: connectedSummary(week41)),
                                        "claude-1": AccountCheckState(summary: connectedSummary(week83)),

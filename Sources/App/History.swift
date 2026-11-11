@@ -5,7 +5,7 @@ import Observation
 // ~/Library/Application Support/AILimits/history.jsonl (mode 0600). Only the fixed
 // account id, a timestamp and remaining percentages are stored.
 
-var historyURL: URL { realHome.appendingPathComponent("Library/Application Support/AILimits/history.jsonl") }
+var historyURL: URL { appDataFolder.appendingPathComponent("history.jsonl") }
 
 private let historyRetention: TimeInterval = 30 * 86_400
 private let historyMinimumGap: TimeInterval = 600
@@ -149,8 +149,8 @@ private final class HistoryWriter: @unchecked Sendable {
     private func pruneIfDue(original: Int) {
         let key = "historyPrunedAt"
         let now = Date()
-        if let previous = UserDefaults.standard.object(forKey: key) as? Date, now.timeIntervalSince(previous) < 86_400 { return }
-        UserDefaults.standard.set(now, forKey: key)
+        if let previous = appDefaults.object(forKey: key) as? Date, now.timeIntervalSince(previous) < 86_400 { return }
+        appDefaults.set(now, forKey: key)
         let kept = pruneHistory(all, now: now)
         guard kept.count < original else { return }
         all = kept

@@ -46,9 +46,10 @@ struct PublishedSnapshot: Codable {
         accounts.count <= maxAccounts && Set(accounts.map(\.id)).count == accounts.count
             && accounts.allSatisfy { isValidAccountID($0.id) }
     }
-    /// The last published rows, or nil when there is no usable file yet.
-    static func loadPublished() -> [AccountRow]? {
-        guard let data = try? Data(contentsOf: publishedSnapshotURL),
+    /// The last published rows, or nil when there is no usable file yet. The widget always
+    /// reads the fixed path; the host passes its own data folder (AI_LIMITS_DATA_DIR).
+    static func loadPublished(from url: URL = publishedSnapshotURL) -> [AccountRow]? {
+        guard let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode(Self.self, from: data), decoded.isValid
         else { return nil }
         return decoded.displayRows
@@ -58,8 +59,9 @@ struct PublishedSnapshot: Codable {
 
 // MARK: - Accounts
 
-/// Widget space: the medium widget has one column per account.
-let maxAccounts = 4
+/// Up to 8 accounts. The medium widget shows up to 4 columns (3 plus a "more" column beyond
+/// that) and the large widget switches to a one-row-per-account list above 4.
+let maxAccounts = 8
 
 enum AccountKind: String, Codable, Sendable {
     case codex, claude
@@ -130,6 +132,13 @@ struct AccountRow: Identifiable {
     var weeklyWindow: TimeInterval? = nil
     /// Why the latest fetch failed, if it did. Host-only: never published.
     var failure: FetchFailure? = nil
+    /// Login email and plan name reported by the CLI's own files or app-server. Host-only and
+    /// in memory only: never published, logged or written to any file.
+    var email: String? = nil
+    var plan: String? = nil
+    /// The account has its own folder (Claude config dir / Codex home) rather than the default
+    /// login. Host-only: never published.
+    var dedicated: Bool = false
 
     /// Short badge and accent, derived from the account type rather than a fixed id.
     var code: String { kind == .codex ? "CX" : "CL" }
@@ -143,6 +152,10 @@ struct AccountExtras {
     var billingAnchor: String? = nil
     var weeklyWindow: TimeInterval? = nil
     var failure: FetchFailure? = nil
+    /// Host-only, in memory only (see AccountRow).
+    var email: String? = nil
+    var plan: String? = nil
+    var dedicated: Bool = false
 }
 
 // MARK: - Fetch failures
@@ -274,9 +287,91 @@ func rows(for slots: [AccountSlot], usages: [String: Usage]?, extras: [String: A
     slots.map { slot in
         AccountRow(id: slot.id, name: slot.name, kind: slot.kind, usage: usages?[slot.id],
                    models: extras[slot.id]?.models ?? [], billingAnchor: extras[slot.id]?.billingAnchor,
-                   weeklyWindow: extras[slot.id]?.weeklyWindow, failure: extras[slot.id]?.failure)
+                   weeklyWindow: extras[slot.id]?.weeklyWindow, failure: extras[slot.id]?.failure,
+                   email: extras[slot.id]?.email, plan: extras[slot.id]?.plan,
+                   dedicated: extras[slot.id]?.dedicated ?? false)
     }
 }
+
+// MARK: - Login emails (host UI only)
+
+/// "a•••@example.com": the first character, three bullets and the domain. Text without "@"
+/// keeps only its first character.
+func maskedEmail(_ email: String) -> String {
+    let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = trimmed.first else { return "" }
+    guard let at = trimmed.lastIndex(of: "@"), at > trimmed.startIndex else { return String(first) + "•••" }
+    return String(first) + "•••" + trimmed[at...]
+}
+
+/// "Max · name@example.com" (masked when `hideEmails`), only the known half, or nil.
+func identityLine(plan: String?, email: String?, hideEmails: Bool) -> String? {
+    let shownEmail = email.map { hideEmails ? maskedEmail($0) : $0 }
+    let parts = [plan, shownEmail].compactMap { $0 }.filter { !$0.isEmpty }
+    return parts.isEmpty ? nil : parts.joined(separator: " · ")
+}
+
+/// Two accounts of the same type that report the same login email (case-insensitive).
+/// `later` is the one asked to sign into another account; `earlier` keeps its login.
+struct SameLoginPair: Equatable {
+    let earlier: String
+    let later: String
+}
+
+/// Every account whose email matches another account of the same type, paired with the account
+/// that keeps the login. The account asked to sign in again is never the default login: of a
+/// group sharing one email, the default-login account (no dedicated folder) keeps it, otherwise
+/// the first in list order does, and every other member is asked to sign in again. Pairs come in
+/// the list order of the account asked. Accounts without an email never match.
+func sameLoginPairs(_ accounts: [(id: String, kind: AccountKind, email: String?, dedicated: Bool)]) -> [SameLoginPair] {
+    var groups: [String: [(id: String, dedicated: Bool)]] = [:]
+    var keys: [(key: String, id: String)] = []
+    for account in accounts {
+        guard let email = account.email?.trimmingCharacters(in: .whitespaces).lowercased(), !email.isEmpty else { continue }
+        let key = account.kind.rawValue + "|" + email
+        groups[key, default: []].append((account.id, account.dedicated))
+        keys.append((key, account.id))
+    }
+    var keeper: [String: String] = [:]
+    for (key, members) in groups where members.count > 1 {
+        keeper[key] = (members.first { !$0.dedicated } ?? members[0]).id
+    }
+    return keys.compactMap { entry in
+        guard let kept = keeper[entry.key], kept != entry.id else { return nil }
+        return SameLoginPair(earlier: kept, later: entry.id)
+    }
+}
+
+/// The pairs the popover and panel warn about: a later account whose last check failed shows
+/// its failure instead, as its setup card does, so Fix never lands on a card without the warning.
+func sameLoginPairs(_ rows: [AccountRow]) -> [SameLoginPair] {
+    let failing = Set(rows.filter { $0.failure != nil }.map(\.id))
+    return sameLoginPairs(rows.map { (id: $0.id, kind: $0.kind, email: $0.email, dedicated: $0.dedicated) })
+        .filter { !failing.contains($0.later) }
+}
+
+/// "Claude 1 and Claude 2 are the same login".
+func sameLoginTitle(_ earlier: String, _ later: String) -> String {
+    L("\(earlier) and \(later) are the same login", "\(earlier) и \(later) — один и тот же вход")
+}
+
+/// What to do about it, for the later account.
+func sameLoginHint(_ later: String, kind: AccountKind) -> String {
+    kind == .claude
+        ? L("Sign \(later) into your other Claude account: open Terminal for its login folder and type /login.",
+            "Войдите в \(later) под другим аккаунтом Claude: откройте Терминал для его папки входа и введите /login.")
+        : L("Sign \(later) into your other ChatGPT account: open Terminal and run codex login for its folder.",
+            "Войдите в \(later) под другим аккаунтом ChatGPT: откройте Терминал и выполните codex login для его папки.")
+}
+
+// MARK: - Widget layouts
+
+/// Large widget: one block per account up to 4, a compact one-row list above that.
+func largeWidgetUsesList(accountCount: Int) -> Bool { accountCount > 4 }
+
+/// Medium widget: one column per account up to 4; with more, a two-column grid of compact
+/// cells (name, week remaining, bar) so every account stays readable.
+func mediumWidgetUsesGrid(accountCount: Int) -> Bool { accountCount > 4 }
 
 // MARK: - Payment estimate
 

@@ -95,6 +95,44 @@ struct GrowOnAppear<Content: View>: View {
     }
 }
 
+/// Shows its content at its natural height; once that exceeds `maxHeight` the content scrolls
+/// inside a box of exactly `maxHeight`. nil (static renders) never scrolls. The content stays
+/// pinned to the top either way, so a height change never shifts what is already on screen.
+struct ScrollingPanel<Content: View>: View {
+    let maxHeight: CGFloat?
+    /// A new value starts the scroll position at the top again (the popover's tab).
+    var resetKey: AnyHashable = 0
+    @ViewBuilder let content: () -> Content
+    @State private var height: CGFloat = 0
+
+    var body: some View {
+        if let maxHeight, height > maxHeight {
+            ScrollView(.vertical) { measured }
+                .scrollIndicators(.automatic)
+                .id(resetKey)
+                .frame(height: maxHeight)
+        } else {
+            measured
+        }
+    }
+
+    private var measured: some View {
+        content()
+            .fixedSize(horizontal: false, vertical: true)
+            .background(GeometryReader { proxy in
+                Color.clear.preference(key: ScrollingContentHeightKey.self, value: proxy.size.height)
+            })
+            .onPreferenceChange(ScrollingContentHeightKey.self) { value in
+                if value > 0, abs(value - height) >= 0.5 { height = value }
+            }
+    }
+}
+
+private struct ScrollingContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 /// Faint highlight under a row while the pointer is over it.
 struct HoverRow: ViewModifier {
     @State private var hovering = false
@@ -121,6 +159,10 @@ struct PopoverContent: View {
     let lastScan: Date?
     let history: [HistorySample]
     let codexPlan: String?
+    /// Login emails are shown masked.
+    var hideEmails = false
+    /// Tallest the whole popover may get (screen height minus a margin); nil never scrolls.
+    var maxHeight: CGFloat?
     /// Off for static renders, where nothing ever appears.
     var animated = true
     /// Height the content wants, reported after each layout; the popover window follows it.
@@ -134,9 +176,12 @@ struct PopoverContent: View {
 
     init(accounts: [AccountRow], now: Date, sourceError: Bool = false, notice: String? = nil, usage: UsageDays, prices: [String: ModelPrice],
          pricesAsOf: Date = builtInPricesDate, firstScanRunning: Bool, lastScan: Date?, history: [HistorySample], codexPlan: String?,
+         hideEmails: Bool = false, maxHeight: CGFloat? = nil,
          tab: PopoverTab = .limits, period: UsagePeriod = .week, animated: Bool = true,
          onHeight: ((CGFloat) -> Void)? = nil, onSetUp: (() -> Void)? = nil, onFix: ((String) -> Void)? = nil) {
         self.animated = animated
+        self.hideEmails = hideEmails
+        self.maxHeight = maxHeight
         self.onHeight = onHeight
         self.onSetUp = onSetUp
         self.onFix = onFix
@@ -157,19 +202,23 @@ struct PopoverContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // The tab switch stays put; only the pane below it scrolls when it is taller than the screen allows.
             SegmentSwitch(options: [(PopoverTab.limits, L("Limits", "Лимиты")), (.analytics, L("Analytics", "Аналитика"))], selection: $tab)
                 .padding(.bottom, 14)
-            // Tabs swap without a transition; the arriving pane fades itself in (GrowOnAppear).
-            if tab == .limits {
-                GrowOnAppear(enabled: animated) {
-                    LimitsSummary(accounts: accounts, now: now, size: .panel, sourceError: sourceError,
-                                  showsPace: true, showsPin: false, notice: notice, onSetUp: onSetUp, onFix: onFix)
-                }
-            } else {
-                GrowOnAppear(enabled: animated) {
-                    AnalyticsPane(accounts: accounts, now: now, usage: usage, prices: prices, pricesAsOf: pricesAsOf,
-                                  firstScanRunning: firstScanRunning, lastScan: lastScan,
-                                  history: history, codexPlan: codexPlan, period: $period)
+            ScrollingPanel(maxHeight: maxHeight.map { max(200, $0 - 16 * 2 - 24 - 14) }, resetKey: tab) {
+                // Tabs swap without a transition; the arriving pane fades itself in (GrowOnAppear).
+                if tab == .limits {
+                    GrowOnAppear(enabled: animated) {
+                        LimitsSummary(accounts: accounts, now: now, size: .panel, sourceError: sourceError,
+                                      showsPace: true, showsPin: false, notice: notice, onSetUp: onSetUp, onFix: onFix,
+                                      hideEmails: hideEmails)
+                    }
+                } else {
+                    GrowOnAppear(enabled: animated) {
+                        AnalyticsPane(accounts: accounts, now: now, usage: usage, prices: prices, pricesAsOf: pricesAsOf,
+                                      firstScanRunning: firstScanRunning, lastScan: lastScan,
+                                      history: history, codexPlan: codexPlan, hideEmails: hideEmails, period: $period)
+                    }
                 }
             }
         }
@@ -214,6 +263,7 @@ struct AnalyticsPane: View {
     let lastScan: Date?
     let history: [HistorySample]
     let codexPlan: String?
+    var hideEmails = false
     @Binding var period: UsagePeriod
 
     private typealias Models = [(model: String, counters: TokenCounters)]
@@ -314,7 +364,7 @@ struct AnalyticsPane: View {
             Rectangle().fill(hairline).frame(height: 1)
             DailyStrip(days: dailyTotals(usage, today: today), highlighted: period.days).padding(.vertical, 12)
             Rectangle().fill(hairline).frame(height: 1)
-            ForecastBlock(accounts: accounts, now: now).padding(.top, 12)
+            ForecastBlock(accounts: accounts, now: now, hideEmails: hideEmails).padding(.top, 12)
 
             if !missing.isEmpty {
                 Text(L("No price: ", "Без цены: ") + unpricedCaption(missing))
@@ -428,6 +478,7 @@ struct DailyStrip: View {
 struct ForecastBlock: View {
     let accounts: [AccountRow]
     let now: Date
+    var hideEmails = false
 
     private func window(_ meter: Meter, _ account: AccountRow) -> TimeInterval? {
         if meter.id == "session" { return account.kind == .claude ? claudeSessionWindow : nil }
@@ -449,14 +500,19 @@ struct ForecastBlock: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        // More than four accounts: tighter rows so eight fit without a wall of text.
+        let compact = accounts.count > 4
+        VStack(alignment: .leading, spacing: compact ? 5 : 8) {
             Text(L("Limit forecast", "Прогноз по лимитам")).font(.system(size: 11)).foregroundStyle(Palette.muted)
             ForEach(accounts) { account in
                 let items = meters(for: account)
+                let identity = identityLine(plan: account.plan, email: account.email, hideEmails: hideEmails)
                 HStack(alignment: .top, spacing: 10) {
+                    // No room for the login next to the forecast: it is in the name's tooltip.
                     Text(account.name).font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.text)
-                        .lineLimit(1).frame(width: 60, alignment: .leading)
-                    VStack(spacing: 2) {
+                        .lineLimit(1).minimumScaleFactor(0.85).frame(width: 84, alignment: .leading)
+                        .help(identity.map { "\(account.name): \($0)" } ?? account.name)
+                    VStack(spacing: compact ? 1 : 2) {
                         if items.isEmpty {
                             Text(L("no data", "нет данных")).font(.system(size: 11)).foregroundStyle(Palette.muted)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -470,9 +526,9 @@ struct ForecastBlock: View {
                                     .foregroundStyle(quotaInk(meter.quota)).frame(width: 36, alignment: .trailing)
                                 Spacer(minLength: 4)
                                 Text(reading.text).font(.system(size: 11)).monospacedDigit()
-                                    .foregroundStyle(reading.ink).lineLimit(1)
+                                    .foregroundStyle(reading.ink).lineLimit(1).minimumScaleFactor(0.85)
                             }
-                            .frame(height: 16)
+                            .frame(height: compact ? 15 : 16)
                             .modifier(HoverRow())
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(L("\(account.name), \(meter.label): \(percentText(meter.quota)) left, \(reading.text)",

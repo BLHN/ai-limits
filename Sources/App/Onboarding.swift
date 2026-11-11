@@ -5,7 +5,8 @@ import Observation
 // The "Set up AI Limits" window: welcome, connect accounts, finish. The account cards show the
 // real QuotaStore checks; every fix is something the user does in Terminal themselves (the app
 // writes a fixed .command script that starts their own CLI and never types into it). Saving
-// writes accounts.json; nothing here reads credentials or the CLIs' own files.
+// writes accounts.json; nothing here reads credentials or the CLIs' own files. Login emails
+// come from the running app's checks (in memory) and are never written anywhere.
 
 let onboardingCompletedKey = "onboardingCompleted"
 let claudeInstallGuideURL = URL(string: "https://docs.anthropic.com/en/docs/claude-code/setup")!
@@ -14,7 +15,7 @@ let widgetSigningGuideURL = URL(string: "https://github.com/BLHN/ai-limits#signi
 
 /// First launch of a fresh install: no accounts.json, never finished the setup, no history yet
 /// (people upgrading from an older version already have a history and are not asked).
-func shouldOfferOnboarding(defaults: UserDefaults = .standard, fileManager: FileManager = .default) -> Bool {
+func shouldOfferOnboarding(defaults: UserDefaults = appDefaults, fileManager: FileManager = .default) -> Bool {
     !defaults.bool(forKey: onboardingCompletedKey)
         && !fileManager.fileExists(atPath: accountsURL.path)
         && !fileManager.fileExists(atPath: historyURL.path)
@@ -38,11 +39,16 @@ struct AccountCheckState: Equatable {
     var saved = true
     /// A check is running or queued.
     var checking = false
+    /// Queued behind other Claude checks (they run one at a time, ~15 s each).
+    var waiting = false
     var failure: FetchFailure?
     /// App-authored description of the failure (never CLI output).
     var detail: String?
     /// "Week 83% left" after a successful check.
     var summary: String?
+    /// Login email and plan as the CLI reports them (in memory only).
+    var email: String? = nil
+    var plan: String? = nil
 }
 
 enum LaunchAtLoginState: Equatable { case off, on, needsApproval }
@@ -81,10 +87,21 @@ struct OnboardingServices {
     var setLaunchAtLogin: @MainActor (Bool) -> Void
     var panelVisible: @MainActor () -> Bool
     var setPanelVisible: @MainActor (Bool) -> Void
+    var hideEmails: @MainActor () -> Bool = { false }
+    var setHideEmails: @MainActor (Bool) -> Void = { _ in }
     var close: @MainActor () -> Void
 }
 
-struct AddClaudeForm: Equatable {
+/// A login folder found in the home folder that is not in the list yet.
+struct LoginSuggestion: Equatable, Hashable, Identifiable {
+    let kind: AccountKind
+    let path: String
+    var id: String { path }
+}
+
+/// The "new login" form: a name and a separate login folder (~/.claude-<name> or ~/.codex-<name>).
+struct AddLoginForm: Equatable {
+    var kind: AccountKind = .claude
     var name = ""
     var folder = ""
     /// The user typed a folder: the name no longer rewrites it.
@@ -97,9 +114,9 @@ struct AddClaudeForm: Equatable {
 @MainActor @Observable final class OnboardingModel {
     var step: OnboardingStep
     var drafts: [AccountDraft] = []
-    /// Extra Claude login folders found in the home folder and not in the list.
-    var suggestions: [String] = []
-    var addForm: AddClaudeForm?
+    /// Extra Claude and Codex login folders found in the home folder and not in the list.
+    var suggestions: [LoginSuggestion] = []
+    var addForm: AddLoginForm?
     /// Card to point at (opened from a failing account in the panel).
     var highlighted: String?
     var expandedDetails: Set<String> = []
@@ -109,6 +126,11 @@ struct AddClaudeForm: Equatable {
     var copiedKey: String?
     var launchAtLogin: LaunchAtLoginState = .off
     var panelVisible = true
+    /// Login emails are shown masked (the app's "Hide Emails" setting). Read live from the app,
+    /// so a toggle in the menu bar while this window is open updates the cards and the switch.
+    var hideEmails: Bool { isStatic ? staticHideEmails : services.hideEmails() }
+    /// The fixture render's own value (no app behind it).
+    var staticHideEmails = false
     /// A save or Terminal problem, shown as one amber line.
     var notice: String?
 
@@ -164,14 +186,35 @@ struct AddClaudeForm: Equatable {
     func refreshSuggestions() {
         guard !isStatic else { return }
         let used = Set(drafts.compactMap { $0.directory.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
-        suggestions = discoverClaudeLogins(home: home).filter { !used.contains(URL(fileURLWithPath: $0).standardizedFileURL.path) }
+        suggestions = [AccountKind.claude, .codex].flatMap { kind in
+            discoverLogins(kind: kind, home: home)
+                .filter { !used.contains(URL(fileURLWithPath: $0).standardizedFileURL.path) }
+                .map { LoginSuggestion(kind: kind, path: $0) }
+        }
     }
 
     func state(of draft: AccountDraft) -> AccountCheckState { services.state(draft) }
 
     var canAdd: Bool { drafts.count < maxAccounts }
     var hasCodex: Bool { drafts.contains { $0.kind == .codex } }
-    var hasDefaultClaude: Bool { drafts.contains { $0.kind == .claude && $0.directory == nil } }
+    var hasDefaultClaude: Bool { hasDefaultLogin(.claude) }
+    func hasDefaultLogin(_ kind: AccountKind) -> Bool { drafts.contains { $0.kind == kind && $0.directory == nil } }
+
+    /// "Max · name@example.com" for a card, masked when emails are hidden.
+    func identity(of draft: AccountDraft) -> String? {
+        let state = state(of: draft)
+        return identityLine(plan: state.plan, email: state.email, hideEmails: hideEmails)
+    }
+
+    /// The card that keeps the login `draft` shares, when `draft` is the one to sign in again
+    /// (never the default login; see sameLoginPairs).
+    func sameLoginEarlier(for draft: AccountDraft) -> AccountDraft? {
+        let pairs = sameLoginPairs(drafts.map {
+            (id: $0.id, kind: $0.kind, email: state(of: $0).email, dedicated: $0.directory != nil)
+        })
+        guard let pair = pairs.first(where: { $0.later == draft.id }) else { return nil }
+        return drafts.first { $0.id == pair.earlier }
+    }
 
     func folderCaption(_ draft: AccountDraft) -> String {
         switch draft.kind {
@@ -195,7 +238,7 @@ struct AddClaudeForm: Equatable {
             panelVisible = services.panelVisible()
             setStep(.finish)
         case .finish:
-            UserDefaults.standard.set(true, forKey: onboardingCompletedKey)
+            appDefaults.set(true, forKey: onboardingCompletedKey)
             services.close()
         }
     }
@@ -236,46 +279,50 @@ struct AddClaudeForm: Equatable {
         save()
     }
 
-    func addSuggestion(_ path: String) {
-        guard canAdd else { return }
-        drafts.append(AccountDraft(id: nextClaudeID(existing: drafts.map(\.id)), kind: .claude,
-                                   name: suggestedName(forClaudeFolder: path), directory: path))
-        suggestions.removeAll { $0 == path }
+    /// Moves a card up (-1) or down (+1); the order is the panel's and the widget's order.
+    func move(_ id: String, by offset: Int) {
+        guard let index = drafts.firstIndex(where: { $0.id == id }) else { return }
+        let target = index + offset
+        guard drafts.indices.contains(target) else { return }
+        drafts.swapAt(index, target)
         edited = true
         save()
     }
 
-    func addCodex() {
-        guard canAdd, !hasCodex else { return }
-        var id = "codex"
-        var number = 2
-        while drafts.contains(where: { $0.id == id }) { id = "codex-\(number)"; number += 1 }
-        drafts.append(AccountDraft(id: id, kind: .codex, name: "Codex", directory: nil))
+    func addSuggestion(_ suggestion: LoginSuggestion) {
+        guard canAdd else { return }
+        drafts.append(AccountDraft(id: nextAccountID(kind: suggestion.kind, existing: drafts.map(\.id)), kind: suggestion.kind,
+                                   name: suggestedName(forFolder: suggestion.path, kind: suggestion.kind), directory: suggestion.path))
+        suggestions.removeAll { $0 == suggestion }
         edited = true
         save()
     }
 
-    /// The default login first; after that every Claude account needs its own folder.
-    func beginAddClaude() {
+    /// The default login first; after that every account of the type needs its own folder.
+    func beginAdd(_ kind: AccountKind) {
         guard canAdd else { return }
-        if !hasDefaultClaude {
-            drafts.append(AccountDraft(id: nextClaudeID(existing: drafts.map(\.id)), kind: .claude, name: "Claude", directory: nil))
+        if !hasDefaultLogin(kind) {
+            drafts.append(AccountDraft(id: nextAccountID(kind: kind, existing: drafts.map(\.id)), kind: kind,
+                                       name: kind == .claude ? "Claude" : "Codex", directory: nil))
             edited = true
             save()
             return
         }
-        addForm = AddClaudeForm(folder: proposedFolder(for: ""))
+        addForm = AddLoginForm(kind: kind, folder: proposedFolder(for: "", kind: kind))
     }
 
-    private func proposedFolder(for name: String) -> String {
-        suggestedClaudeFolder(name: name, home: home, taken: drafts.compactMap(\.directory),
-                              exists: isStatic ? { _ in false } : { FileManager.default.fileExists(atPath: $0) })
+    func beginAddClaude() { beginAdd(.claude) }
+    func addCodex() { beginAdd(.codex) }
+
+    private func proposedFolder(for name: String, kind: AccountKind) -> String {
+        suggestedLoginFolder(kind: kind, name: name, home: home, taken: drafts.compactMap(\.directory),
+                             exists: isStatic ? { _ in false } : { FileManager.default.fileExists(atPath: $0) })
     }
 
     func setFormName(_ name: String) {
         guard var form = addForm else { return }
         form.name = String(name.prefix(32))
-        if !form.folderEdited { form.folder = proposedFolder(for: form.name) }
+        if !form.folderEdited { form.folder = proposedFolder(for: form.name, kind: form.kind) }
         form.error = nil
         addForm = form
     }
@@ -300,15 +347,16 @@ struct AddClaudeForm: Equatable {
             addForm = form; return
         }
         let standard = URL(fileURLWithPath: path).standardizedFileURL.path
-        if standard == home.appendingPathComponent(".claude").path || standard == home.path {
-            form.error = L("That is the default login. Pick a separate folder, such as ~/.claude-work.",
-                           "Это основной вход. Выберите отдельную папку, например ~/.claude-work.")
+        let example = "~/" + loginFolderPrefix(form.kind) + "-work"
+        if standard == home.appendingPathComponent(loginFolderPrefix(form.kind)).path || standard == home.path {
+            form.error = L("That is the default login. Pick a separate folder, such as \(example).",
+                           "Это основной вход. Выберите отдельную папку, например \(example).")
             addForm = form; return
         }
-        // Claude writes its whole state into this folder, so keep it a dedicated folder in the home folder.
+        // The CLI writes its whole state into this folder, so keep it a dedicated folder in the home folder.
         guard standard.hasPrefix(home.path + "/"), URL(fileURLWithPath: standard).lastPathComponent.hasPrefix(".") else {
-            form.error = L("Use a hidden folder in your home folder, such as ~/.claude-work.",
-                           "Нужна скрытая папка в домашней папке, например ~/.claude-work.")
+            form.error = L("Use a hidden folder in your home folder, such as \(example).",
+                           "Нужна скрытая папка в домашней папке, например \(example).")
             addForm = form; return
         }
         if drafts.contains(where: { $0.directory.map { URL(fileURLWithPath: $0).standardizedFileURL.path } == standard }) {
@@ -324,8 +372,9 @@ struct AddClaudeForm: Equatable {
                 addForm = form; return
             }
         }
-        drafts.append(AccountDraft(id: nextClaudeID(existing: drafts.map(\.id)), kind: .claude, name: name, directory: standard))
-        suggestions.removeAll { URL(fileURLWithPath: $0).standardizedFileURL.path == standard }
+        drafts.append(AccountDraft(id: nextAccountID(kind: form.kind, existing: drafts.map(\.id)), kind: form.kind,
+                                   name: name, directory: standard))
+        suggestions.removeAll { URL(fileURLWithPath: $0.path).standardizedFileURL.path == standard }
         addForm = nil
         edited = true
         save()
@@ -399,7 +448,8 @@ struct AddClaudeForm: Equatable {
         let kind = draft.kind
         let directory = draft.directory
         let home = home
-        let name = kind == .codex ? "codex" : "claude-\(draft.id)"
+        // One script per account: codex.command, codex-2.command, claude-claude-1.command...
+        let name = kind == .codex ? draft.id : "claude-\(draft.id)"
         Task {
             let script = await Task.detached(priority: .userInitiated) { () -> URL? in
                 guard let cli = CLILocator.shared.locate(kind.rawValue) else { return nil }
@@ -428,7 +478,10 @@ struct AddClaudeForm: Equatable {
         for (id, until) in watching {
             guard until > now, let draft = drafts.first(where: { $0.id == id }) else { watching[id] = nil; continue }
             let state = services.state(draft)
-            if state.failure == nil, state.summary != nil, !state.checking { watching[id] = nil; continue }
+            // Done once connected, and for a duplicate login once it reports another email.
+            if state.failure == nil, state.summary != nil, !state.checking, sameLoginEarlier(for: draft) == nil {
+                watching[id] = nil; continue
+            }
             if !state.checking, now.timeIntervalSince(lastRecheck[id] ?? .distantPast) >= 5 {
                 lastRecheck[id] = now
                 services.recheck([id])
@@ -446,6 +499,10 @@ struct AddClaudeForm: Equatable {
     func setPanelVisible(_ on: Bool) {
         if !isStatic { services.setPanelVisible(on) }
         panelVisible = isStatic ? on : services.panelVisible()
+    }
+
+    func setHideEmails(_ on: Bool) {
+        if isStatic { staticHideEmails = on } else { services.setHideEmails(on) }
     }
 }
 
@@ -529,7 +586,7 @@ final class OnboardingWindow: NSWindow {
     func windowWillClose(_ notification: Notification) {
         // Seen once is enough: the window does not reopen by itself on later launches.
         // It stays one click away under Accounts... in the menu.
-        UserDefaults.standard.set(true, forKey: onboardingCompletedKey)
+        appDefaults.set(true, forKey: onboardingCompletedKey)
         model?.stop()
         model = nil
         window = nil
@@ -776,11 +833,11 @@ struct AccountsStep: View {
                     AccountCard(model: model, draft: draft)
                         .id(draft.id)
                 }
-                ForEach(model.suggestions, id: \.self) { path in
-                    SuggestionRow(model: model, path: path)
+                ForEach(model.suggestions) { suggestion in
+                    SuggestionRow(model: model, suggestion: suggestion)
                 }
                 if let form = model.addForm {
-                    AddClaudeCard(model: model, form: form)
+                    AddLoginCard(model: model, form: form)
                 } else {
                     addButtons
                 }
@@ -807,21 +864,16 @@ struct AccountsStep: View {
                 }
                 .buttonStyle(OutlineButtonStyle())
                 .disabled(!model.canAdd)
-                if !model.hasCodex {
-                    Button { model.addCodex() } label: {
-                        Label(L("Add Codex", "Добавить Codex"), systemImage: "plus")
-                    }
-                    .buttonStyle(OutlineButtonStyle())
-                    .disabled(!model.canAdd)
+                Button { model.addCodex() } label: {
+                    Label(L("Add Codex account", "Добавить Codex"), systemImage: "plus")
                 }
+                .buttonStyle(OutlineButtonStyle())
+                .disabled(!model.canAdd)
                 Spacer(minLength: 0)
             }
             Text(model.canAdd
-                 ? (model.hasDefaultClaude
-                    ? L("Each extra Claude subscription needs its own login folder; you sign in there once.",
-                        "Для каждой дополнительной подписки Claude нужна своя папка входа; войти в неё нужно один раз.")
-                    : L("Codex has one login; Claude can have several, each in its own login folder.",
-                        "У Codex один вход; у Claude их может быть несколько, у каждого своя папка входа."))
+                 ? L("The first Claude and Codex accounts use the default login; each extra subscription gets its own login folder, and you sign in there once.",
+                     "Первые аккаунты Claude и Codex используют основной вход; каждой дополнительной подписке нужна своя папка входа, войти в неё нужно один раз.")
                  : L("AI\u{00A0}Limits shows up to \(maxAccounts) accounts. Remove one to add another.",
                      "AI\u{00A0}Limits показывает до \(maxAccounts) аккаунтов. Удалите один, чтобы добавить другой."))
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
@@ -910,15 +962,24 @@ struct AccountCard: View {
     var body: some View {
         let state = model.state(of: draft)
         let highlighted = model.highlighted == draft.id
+        let index = model.drafts.firstIndex(where: { $0.id == draft.id }) ?? 0
+        let duplicateOf = state.failure == nil ? model.sameLoginEarlier(for: draft) : nil
         HStack(alignment: .top, spacing: 12) {
             ProviderMark(kind: draft.kind).padding(.top, 1)
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 6) {
+                HStack(spacing: 2) {
                     InlineField(placeholder: draft.kind == .codex ? "Codex" : "Claude",
                                 text: Binding(get: { draft.name }, set: { model.rename(draft.id, to: $0) }),
                                 isStatic: model.isStatic, size: 13, weight: .semibold, framed: false)
                         .padding(.leading, -5)
+                        .padding(.trailing, 4)
                         .accessibilityLabel(L("Account name", "Имя аккаунта"))
+                    if model.drafts.count > 1 {
+                        moveButton("chevron.up", enabled: index > 0, offset: -1,
+                                   label: L("Move \(draft.name) up", "Поднять \(draft.name)"))
+                        moveButton("chevron.down", enabled: index < model.drafts.count - 1, offset: 1,
+                                   label: L("Move \(draft.name) down", "Опустить \(draft.name)"))
+                    }
                     Button { model.remove(draft.id) } label: {
                         Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
                             .frame(width: 22, height: 22)
@@ -927,12 +988,20 @@ struct AccountCard: View {
                     .help(L("Remove from AI\u{00A0}Limits (the login itself stays)", "Убрать из AI\u{00A0}Limits (сам вход останется)"))
                     .accessibilityLabel(L("Remove \(draft.name)", "Убрать \(draft.name)"))
                 }
+                if let identity = model.identity(of: draft) {
+                    Text(identity).font(.system(size: 11)).foregroundStyle(Palette.text.opacity(0.78))
+                        .lineLimit(1).truncationMode(.middle)
+                        .help(L("Plan and login, as the CLI reports them", "Тариф и вход по данным CLI"))
+                }
                 Text(model.folderCaption(draft)).font(.system(size: 11)).foregroundStyle(Palette.muted)
                     .lineLimit(1).truncationMode(.middle)
                 StatusLine(state: state, kind: draft.kind, isStatic: model.isStatic)
                     .padding(.top, 8)
                 if let failure = state.failure {
                     FixBlock(model: model, draft: draft, failure: failure, detail: state.detail)
+                        .padding(.top, 10)
+                } else if let duplicateOf {
+                    SameLoginBlock(model: model, draft: draft, earlier: duplicateOf)
                         .padding(.top, 10)
                 }
             }
@@ -943,6 +1012,63 @@ struct AccountCard: View {
             .stroke(Palette.text.opacity(highlighted ? 0.36 : 0.08), lineWidth: 1))
         .animation(.easeOut(duration: 0.3), value: highlighted)
         .accessibilityElement(children: .contain)
+    }
+
+    private func moveButton(_ symbol: String, enabled: Bool, offset: Int, label: String) -> some View {
+        Button { model.move(draft.id, by: offset) } label: {
+            Image(systemName: symbol).font(.system(size: 9, weight: .semibold))
+                .frame(width: 20, height: 22)
+        }
+        .buttonStyle(LinkButtonStyle())
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.3)
+        .help(L("Order of the accounts in the panel and the widget", "Порядок аккаунтов в панели и виджете"))
+        .accessibilityLabel(label)
+    }
+}
+
+/// Two cards report the same login email: `draft` (the one with its own folder) is signed into
+/// the wrong account.
+struct SameLoginBlock: View {
+    @Bindable var model: OnboardingModel
+    let draft: AccountDraft
+    let earlier: AccountDraft
+
+    var body: some View {
+        let task: TerminalTask = draft.kind == .claude ? .claudeLogin : .codexLogin
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Image(systemName: "exclamationmark.circle.fill").font(.system(size: 12)).foregroundStyle(Palette.amber)
+                Text(sameLoginTitle(earlier.name, draft.name)).font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Palette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(sameLoginHint(draft.name, kind: draft.kind))
+                .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button { model.openTerminal(task, for: draft) } label: {
+                    Label(L("Open Terminal", "Открыть Терминал"), systemImage: "terminal")
+                }
+                .buttonStyle(FilledButtonStyle())
+                Button(L("Check again", "Проверить снова")) { model.checkAgain(draft) }
+                    .buttonStyle(OutlineButtonStyle())
+                Spacer(minLength: 0)
+            }
+            CommandRow(command: model.command(task, for: draft), copied: model.copiedKey == draft.id) {
+                model.copyCommand(task, for: draft)
+            }
+            if model.watching[draft.id] != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "hourglass").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                    Text(L("Waiting for you in Terminal. This card updates by itself once the login changes.",
+                           "Ждём вас в Терминале. Карточка обновится сама, когда вход сменится."))
+                        .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -959,7 +1085,10 @@ struct StatusLine: View {
                     .foregroundStyle(Palette.muted)
             } else if state.checking {
                 Spinner(animated: !isStatic).frame(width: 12)
-                Text(state.failure == nil
+                Text(state.waiting
+                     ? (kind == .claude ? L("Waiting for other Claude checks", "Жду другие проверки Claude")
+                                        : L("Waiting for other Codex checks", "Жду другие проверки Codex"))
+                     : state.failure == nil
                      ? (kind == .claude ? L("Checking, about 15 seconds", "Проверяю, около 15 секунд") : L("Checking", "Проверяю"))
                      : L("Checking again", "Проверяю снова"))
                     .foregroundStyle(Palette.muted)
@@ -1000,8 +1129,8 @@ func failureExplanation(_ failure: FetchFailure, kind: AccountKind) -> String {
             : L("Install the Codex CLI and sign in, then check again. AI\u{00A0}Limits looks in the usual install folders and your shell's PATH.",
                 "Установите Codex CLI и войдите, затем проверьте снова. AI\u{00A0}Limits ищет его в обычных папках установки и в PATH оболочки.")
     case .probeNotTrusted:
-        return L("Claude Code asks once whether to trust the folder AI\u{00A0}Limits checks from. AI\u{00A0}Limits never answers for you: open Terminal, choose \"Yes\", then close it.",
-                 "Claude Code один раз спрашивает, доверять ли папке, из которой проверяет AI\u{00A0}Limits. Сам AI\u{00A0}Limits не отвечает: откройте Терминал, выберите «Yes» и закройте его.")
+        return L("Claude Code asks once whether to trust the folder AI\u{00A0}Limits checks from. AI\u{00A0}Limits never answers for you: open Terminal, pick \"Yes, I trust this folder\" with the arrow keys and press Enter.",
+                 "Claude Code один раз спрашивает, доверять ли папке, из которой проверяет AI\u{00A0}Limits. Сам AI\u{00A0}Limits не отвечает: откройте Терминал, стрелками выберите «Yes, I trust this folder» и нажмите Enter.")
     case .notLoggedIn:
         return kind == .claude
             ? L("Open Terminal and type /login to sign in. Already signed in? Then this plan has no usage limits to show.",
@@ -1120,19 +1249,20 @@ struct CommandRow: View {
 
 struct SuggestionRow: View {
     @Bindable var model: OnboardingModel
-    let path: String
+    let suggestion: LoginSuggestion
 
     var body: some View {
         HStack(spacing: 12) {
-            ProviderMark(kind: .claude).opacity(0.6)
+            ProviderMark(kind: suggestion.kind).opacity(0.6)
             VStack(alignment: .leading, spacing: 1) {
-                Text(L("Found another Claude login", "Найден ещё один вход Claude"))
+                Text(suggestion.kind == .claude ? L("Found another Claude login", "Найден ещё один вход Claude")
+                                                : L("Found another Codex login", "Найден ещё один вход Codex"))
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.text)
-                Text(displayPath(path, home: model.home)).font(.system(size: 11)).foregroundStyle(Palette.muted)
+                Text(displayPath(suggestion.path, home: model.home)).font(.system(size: 11)).foregroundStyle(Palette.muted)
                     .lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: 8)
-            Button(L("Add", "Добавить")) { model.addSuggestion(path) }
+            Button(L("Add", "Добавить")) { model.addSuggestion(suggestion) }
                 .buttonStyle(OutlineButtonStyle())
                 .disabled(!model.canAdd)
                 .help(model.canAdd ? "" : L("AI\u{00A0}Limits shows up to \(maxAccounts) accounts", "AI\u{00A0}Limits показывает до \(maxAccounts) аккаунтов"))
@@ -1144,15 +1274,17 @@ struct SuggestionRow: View {
     }
 }
 
-struct AddClaudeCard: View {
+struct AddLoginCard: View {
     @Bindable var model: OnboardingModel
-    let form: AddClaudeForm
+    let form: AddLoginForm
 
     var body: some View {
+        let claude = form.kind == .claude
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
-                ProviderMark(kind: .claude)
-                Text(L("New Claude login", "Новый вход Claude")).font(.system(size: 13, weight: .semibold))
+                ProviderMark(kind: form.kind)
+                Text(claude ? L("New Claude login", "Новый вход Claude") : L("New Codex login", "Новый вход Codex"))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Palette.text)
             }
             row(L("Name", "Имя")) {
@@ -1161,12 +1293,15 @@ struct AddClaudeCard: View {
                             isStatic: model.isStatic, onSubmit: { model.commitAddForm() })
             }
             row(L("Folder", "Папка")) {
-                InlineField(placeholder: "~/.claude-work",
+                InlineField(placeholder: "~/" + loginFolderPrefix(form.kind) + "-work",
                             text: Binding(get: { form.folder }, set: { model.setFormFolder($0) }),
                             isStatic: model.isStatic, size: 11.5, monospaced: true, onSubmit: { model.commitAddForm() })
             }
-            Text(L("Each extra Claude subscription needs its own login folder. AI\u{00A0}Limits creates it; next you sign in there once from Terminal.",
-                   "Каждой дополнительной подписке Claude нужна своя папка входа. AI\u{00A0}Limits её создаст, а потом вы один раз войдёте в неё из Терминала."))
+            Text(claude
+                 ? L("Each extra Claude subscription needs its own login folder. AI\u{00A0}Limits creates it; next you sign in there once from Terminal.",
+                     "Каждой дополнительной подписке Claude нужна своя папка входа. AI\u{00A0}Limits её создаст, а потом вы один раз войдёте в неё из Терминала.")
+                 : L("Each extra ChatGPT login needs its own Codex folder (CODEX_HOME). AI\u{00A0}Limits creates it; next you run codex login there once from Terminal.",
+                     "Каждому дополнительному входу ChatGPT нужна своя папка Codex (CODEX_HOME). AI\u{00A0}Limits её создаст, а потом вы один раз выполните в ней codex login из Терминала."))
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.leading, 64)
@@ -1259,6 +1394,11 @@ struct FinishStep: View {
                 toggleRow(symbol: "macwindow.on.rectangle", title: L("Floating panel", "Плавающая панель"),
                           body: L("A small always-on-top window with the same limits.", "Небольшое окно поверх остальных с теми же лимитами."),
                           isOn: model.panelVisible) { model.setPanelVisible($0) }
+                Rectangle().fill(hairline).frame(height: 1)
+                toggleRow(symbol: "eye.slash", title: L("Hide emails", "Скрыть почты"),
+                          body: L("Show logins as d•••@example.com, for screenshots and screen sharing.",
+                                  "Показывать входы как d•••@example.com — для скриншотов и показа экрана."),
+                          isOn: model.hideEmails) { model.setHideEmails($0) }
                 Rectangle().fill(hairline).frame(height: 1)
                 HStack(alignment: .top, spacing: 12) {
                     icon("square.grid.2x2")

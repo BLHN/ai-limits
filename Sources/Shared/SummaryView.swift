@@ -252,6 +252,8 @@ struct LimitsSummary: View {
     var onSetUp: (() -> Void)? = nil
     /// Host only: opens the account setup on the account with this id from its failure hint.
     var onFix: ((String) -> Void)? = nil
+    /// Host only: login emails are shown masked ("d•••@example.com").
+    var hideEmails = false
 
     private func isStale(_ account: AccountRow) -> Bool {
         (measurementAge(account.usage, now: now) ?? .infinity) > 180
@@ -298,6 +300,117 @@ struct LimitsSummary: View {
         }
     }
 
+    /// Main remaining figure of an account: the week, else the session.
+    private func headlineQuota(_ account: AccountRow) -> Quota? {
+        account.usage?.secondary ?? account.usage?.primary
+    }
+
+    /// Medium widget with more than 4 accounts: two columns of cells, filled top to bottom,
+    /// each with the name, the week (else session) remaining and its bar.
+    private var grid: some View {
+        let half = (accounts.count + 1) / 2
+        let columns = [Array(accounts.prefix(half)), Array(accounts.dropFirst(half))]
+        return HStack(alignment: .top, spacing: 11) {
+            ForEach(0..<2, id: \.self) { column in
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(columns[column].enumerated()), id: \.element.id) { index, account in
+                        if index > 0 { Spacer(minLength: 4) }
+                        gridCell(account)
+                    }
+                    if columns[column].count < half { Spacer(minLength: 4); Color.clear.frame(height: 24) }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                if column == 0 { Rectangle().fill(hairline).frame(width: 1) }
+            }
+        }
+    }
+
+    private func gridCell(_ account: AccountRow) -> some View {
+        let quota = headlineQuota(account)
+        // A delayed measurement (older than 3 min): an amber clock and a muted figure, as the
+        // columns layout shows an amber age; the cell has no room for the age text itself.
+        let delayed = quota != nil && isStale(account)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(account.name).font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.text)
+                    .lineLimit(1).minimumScaleFactor(0.85)
+                Spacer(minLength: 0)
+                if delayed {
+                    Image(systemName: "clock").font(.system(size: 9, weight: .semibold)).foregroundStyle(Palette.amber)
+                }
+                Text(percentText(quota)).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(delayed ? Palette.muted : quotaInk(quota)).lineLimit(1).fixedSize()
+            }
+            Group {
+                if let quota { MeterBar(quota: quota, height: 3) } else { Capsule().fill(Palette.text.opacity(0.10)) }
+            }.frame(height: 3)
+        }
+        .frame(height: 24)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel((quota.map { L("\(account.name): \(percentWords(Int($0.remaining.rounded()))) left",
+                                           "\(account.name): осталось \(percentWords(Int($0.remaining.rounded())))") }
+                             ?? L("\(account.name): no data", "\(account.name): нет данных"))
+                            + (delayed ? ", " + ageLabel(account.usage, now: now) : ""))
+        .help(delayed ? ageLabel(account.usage, now: now) : "")
+    }
+
+    // MARK: Large widget with more than 4 accounts — one row per account
+
+    private var compactList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("AI Limits").font(.system(size: 13, weight: .semibold)).foregroundStyle(Palette.text)
+                Spacer()
+                Text(L("remaining", "остаток")).font(.system(size: 11)).foregroundStyle(Palette.muted)
+            }.padding(.bottom, 6)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Text(L("Session", "Сеанс")).frame(width: 46, alignment: .trailing)
+                Text(L("Week", "Неделя")).frame(width: 46, alignment: .trailing)
+                Color.clear.frame(width: 50, height: 1)
+            }
+            .font(.system(size: 10)).foregroundStyle(Palette.muted).lineLimit(1)
+            .padding(.bottom, 3)
+            ForEach(accounts) { account in
+                Rectangle().fill(hairline).frame(height: 1)
+                HStack(spacing: 8) {
+                    Text(account.name).font(.system(size: 12, weight: .semibold)).foregroundStyle(Palette.text)
+                        .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                    if account.usage?.primary == nil && account.usage?.secondary == nil {
+                        Text(L("no data", "нет данных")).font(.system(size: 11)).foregroundStyle(Palette.muted)
+                            .lineLimit(1)
+                    } else {
+                        Text(account.usage?.primary.map { percentText($0) } ?? "")
+                            .font(.system(size: 12, weight: .medium)).monospacedDigit()
+                            .foregroundStyle(quotaInk(account.usage?.primary)).lineLimit(1)
+                            .frame(width: 46, alignment: .trailing)
+                        Text(percentText(account.usage?.secondary))
+                            .font(.system(size: 12, weight: .medium)).monospacedDigit()
+                            .foregroundStyle(quotaInk(account.usage?.secondary)).lineLimit(1)
+                            .frame(width: 46, alignment: .trailing)
+                        Group {
+                            if let week = account.usage?.secondary { MeterBar(quota: week, height: 3) } else { Color.clear }
+                        }.frame(width: 50, height: 3)
+                    }
+                }
+                .frame(height: 25)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(compactAccessibility(account))
+            }
+            Rectangle().fill(hairline).frame(height: 1)
+            Spacer(minLength: 0)
+            footer.padding(.top, 6)
+        }
+    }
+
+    private func compactAccessibility(_ account: AccountRow) -> String {
+        let items = meters(for: account).filter { $0.id == "session" || $0.id == "week" }
+        guard !items.isEmpty else { return L("\(account.name): no data", "\(account.name): нет данных") }
+        let parts = items.map { L("\($0.label) \(percentWords(Int($0.quota.remaining.rounded()))) left",
+                                  "\($0.label): осталось \(percentWords(Int($0.quota.remaining.rounded())))") }
+        return account.name + ": " + parts.joined(separator: ", ")
+    }
+
     // MARK: Panel and large widget — one block per account
 
     private var freshest: Date? {
@@ -328,6 +441,9 @@ struct LimitsSummary: View {
 
     private var blocks: some View {
         let roomy = size == .panel
+        // More than four accounts in the panel: shorter blocks so eight still read at a glance.
+        let crowded = roomy && accounts.count > 4
+        let pairs = size == .panel ? sameLoginPairs(accounts) : []
         // Four accounts in the large widget: tighter blocks; with many meters the title goes too.
         let dense = size == .large && accounts.count >= 4
         let showsTitle = !dense || accounts.reduce(0) { $0 + max(1, meters(for: $1).count) } <= 10
@@ -337,7 +453,7 @@ struct LimitsSummary: View {
                     Text("AI Limits").font(.system(size: dense ? 13 : 15, weight: .semibold)).foregroundStyle(Palette.text)
                     Spacer()
                     Text(L("remaining", "остаток")).font(.system(size: 11)).foregroundStyle(Palette.muted)
-                }.padding(.bottom, notice == nil ? (roomy ? 14 : dense ? 6 : 10) : 6)
+                }.padding(.bottom, notice == nil && pairs.isEmpty ? (roomy ? (crowded ? 10 : 14) : dense ? 6 : 10) : 6)
             }
             if let notice {
                 Text(notice).font(.system(size: 11)).foregroundStyle(Palette.amber.opacity(0.8))
@@ -345,14 +461,24 @@ struct LimitsSummary: View {
                     .padding(.bottom, roomy ? 10 : 8)
                     .help(notice)
             }
+            ForEach(pairs, id: \.later) { pair in
+                sameLoginLine(pair).padding(.bottom, 8)
+            }
             ForEach(Array(accounts.enumerated()), id: \.element.id) { _, account in
                 Rectangle().fill(hairline).frame(height: 1)
-                VStack(alignment: .leading, spacing: roomy ? 6 : dense ? 1 : 4) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(account.name).font(.system(size: dense ? 12 : 13, weight: .semibold))
-                            .foregroundStyle(Palette.text).lineLimit(1)
-                        Spacer()
-                        accountNote(account, short: false).font(.system(size: 11)).monospacedDigit()
+                VStack(alignment: .leading, spacing: roomy ? (crowded ? 4 : 6) : dense ? 1 : 4) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(account.name).font(.system(size: dense ? 12 : 13, weight: .semibold))
+                                .foregroundStyle(Palette.text).lineLimit(1)
+                            Spacer()
+                            accountNote(account, short: false).font(.system(size: 11)).monospacedDigit()
+                        }
+                        if size == .panel, let identity = identityLine(plan: account.plan, email: account.email, hideEmails: hideEmails) {
+                            Text(identity).font(.system(size: 11)).foregroundStyle(Palette.muted)
+                                .lineLimit(1).truncationMode(.middle)
+                                .help(L("Plan and login of this account, as its CLI reports them", "Тариф и вход этого аккаунта по данным его CLI"))
+                        }
                     }
                     let items = meters(for: account)
                     if items.isEmpty {
@@ -375,12 +501,31 @@ struct LimitsSummary: View {
                             }
                         }
                     }
-                }.padding(.vertical, roomy ? 12 : dense ? 5 : 11)
+                }.padding(.vertical, roomy ? (crowded ? 8 : 12) : dense ? 5 : 11)
             }
             Rectangle().fill(hairline).frame(height: 1)
             if size == .large { Spacer(minLength: 0) }
-            footer.padding(.top, roomy ? 12 : dense ? 6 : 9)
+            footer.padding(.top, roomy ? (crowded ? 10 : 12) : dense ? 6 : 9)
         }
+    }
+
+    /// Amber note that two accounts are signed into the same login; Fix opens the later one's card.
+    @ViewBuilder private func sameLoginLine(_ pair: SameLoginPair) -> some View {
+        let earlier = accounts.first { $0.id == pair.earlier }
+        let later = accounts.first { $0.id == pair.later }
+        let title = sameLoginTitle(earlier?.name ?? pair.earlier, later?.name ?? pair.later)
+        let hint = sameLoginHint(later?.name ?? pair.later, kind: later?.kind ?? .claude)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title).font(.system(size: 11)).foregroundStyle(Palette.amber.opacity(0.8))
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if let onFix {
+                Button(L("Fix", "Исправить")) { onFix(pair.later) }
+                    .buttonStyle(LinkButtonStyle())
+                    .accessibilityLabel(L("Fix \(later?.name ?? pair.later)", "Исправить: \(later?.name ?? pair.later)"))
+            }
+        }
+        .help(hint)
     }
 
     /// Amber reason for a failed check; in the host it opens the account setup on this account.
@@ -432,7 +577,10 @@ struct LimitsSummary: View {
 
     var body: some View {
         Group {
-            if accounts.isEmpty { setupNote } else if size == .medium { columns } else { blocks }
+            if accounts.isEmpty { setupNote }
+            else if size == .medium { mediumWidgetUsesGrid(accountCount: accounts.count) ? AnyView(grid) : AnyView(columns) }
+            else if size == .large && largeWidgetUsesList(accountCount: accounts.count) { compactList }
+            else { blocks }
         }
         .accessibilityElement(children: .contain)
     }
