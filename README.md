@@ -39,7 +39,7 @@ Screenshots are rendered from fixture data, not from a real account.
 ## Install
 
 ```sh
-git clone <this repository> ai-limits
+git clone https://github.com/BLHN/ai-limits.git
 cd ai-limits
 ./build.sh                 # builds into ./build and runs the self-test
 scripts/install.sh         # copies "AI Limits.app" to ~/Applications and opens it

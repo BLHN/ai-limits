@@ -34,7 +34,7 @@ AI Limits — небольшое приложение для строки мен
 ## Установка
 
 ```sh
-git clone <адрес репозитория> ai-limits
+git clone https://github.com/BLHN/ai-limits.git
 cd ai-limits
 ./build.sh                 # собирает в ./build и прогоняет самотест
 scripts/install.sh         # копирует «AI Limits.app» в ~/Applications и запускает
