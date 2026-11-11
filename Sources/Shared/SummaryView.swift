@@ -34,6 +34,62 @@ func paymentInk(_ anchor: String?, now: Date) -> Color {
     (paymentDaysAway(anchor: anchor, now: now) ?? .max) <= 3 ? Palette.amber : Palette.muted
 }
 
+/// Filled light button: the one primary action of a view.
+struct FilledButtonStyle: ButtonStyle {
+    var height: CGFloat = 26
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Palette.background)
+            .lineLimit(1)
+            .padding(.horizontal, 12)
+            .frame(height: height)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(Palette.text.opacity(enabled ? (configuration.isPressed ? 0.75 : 0.92) : 0.30)))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+/// Outlined button for secondary actions.
+struct OutlineButtonStyle: ButtonStyle {
+    var height: CGFloat = 26
+    @Environment(\.isEnabled) private var enabled
+    @State private var hovering = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12))
+            .foregroundStyle(enabled ? Palette.text : Palette.muted.opacity(0.6))
+            .lineLimit(1)
+            .padding(.horizontal, 11)
+            .frame(height: height)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(Palette.text.opacity(configuration.isPressed ? 0.12 : hovering && enabled ? 0.07 : 0.03)))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Palette.text.opacity(enabled ? 0.14 : 0.07), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+            .onHover { inside in withAnimation(.easeOut(duration: 0.12)) { hovering = inside } }
+    }
+}
+
+/// Text-only link: muted ink that brightens under the pointer.
+struct LinkButtonStyle: ButtonStyle {
+    var size: CGFloat = 11
+    var weight: Font.Weight = .medium
+    @State private var hovering = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: size, weight: weight))
+            .foregroundStyle(hovering || configuration.isPressed ? Palette.text : Palette.text.opacity(0.78))
+            .underline(hovering)
+            .contentShape(Rectangle())
+            .onHover { inside in hovering = inside }
+    }
+}
+
 /// One limit of one account, in display order: session, week, then per-model windows.
 struct Meter: Identifiable {
     let id: String
@@ -192,6 +248,10 @@ struct LimitsSummary: View {
     var showsPin = true
     /// Problem with accounts.json, shown as one muted amber line (host only).
     var notice: String? = nil
+    /// Host only: opens the account setup from the empty state.
+    var onSetUp: (() -> Void)? = nil
+    /// Host only: opens the account setup on the account with this id from its failure hint.
+    var onFix: ((String) -> Void)? = nil
 
     private func isStale(_ account: AccountRow) -> Bool {
         (measurementAge(account.usage, now: now) ?? .infinity) > 180
@@ -298,17 +358,13 @@ struct LimitsSummary: View {
                     if items.isEmpty {
                         if let failure = account.failure {
                             // No numbers yet: the reason replaces "No limits reported".
-                            Text(fetchHint(failure, kind: account.kind)).font(.system(size: 11)).foregroundStyle(Palette.amber.opacity(0.8))
-                                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                                .help(fetchHintDetail(failure, kind: account.kind))
+                            failureLine(failure, account: account)
                         } else {
                             Text(L("No limits reported", "Сервис не передал лимиты")).font(.system(size: 11)).foregroundStyle(Palette.muted)
                         }
                     } else if let failure = account.failure, isStale(account) {
                         // Old numbers stay; a muted amber line says why they are not updating.
-                        Text(fetchHint(failure, kind: account.kind)).font(.system(size: 11)).foregroundStyle(Palette.amber.opacity(0.8))
-                            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                            .help(fetchHintDetail(failure, kind: account.kind))
+                        failureLine(failure, account: account)
                     }
                     VStack(spacing: roomy ? 2 : 0) {
                         ForEach(items) { meter in
@@ -327,6 +383,24 @@ struct LimitsSummary: View {
         }
     }
 
+    /// Amber reason for a failed check; in the host it opens the account setup on this account.
+    @ViewBuilder private func failureLine(_ failure: FetchFailure, account: AccountRow) -> some View {
+        let hint = Text(onFix == nil ? fetchHint(failure, kind: account.kind) : fixHint(failure, kind: account.kind)).font(.system(size: 11)).foregroundStyle(Palette.amber.opacity(0.8))
+            .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+        if let onFix {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                hint.onTapGesture { onFix(account.id) }
+                Spacer(minLength: 0)
+                Button(L("Fix", "Исправить")) { onFix(account.id) }
+                    .buttonStyle(LinkButtonStyle())
+                    .accessibilityLabel(L("Fix \(account.name)", "Исправить: \(account.name)"))
+            }
+            .help(fetchHintDetail(failure, kind: account.kind))
+        } else {
+            hint.help(fetchHintDetail(failure, kind: account.kind))
+        }
+    }
+
     /// Nothing configured or detected: a short setup note instead of empty blocks.
     private var setupNote: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -336,8 +410,14 @@ struct LimitsSummary: View {
                 Text(SetupText.emptyTitle).font(.system(size: 13, weight: .semibold)).foregroundStyle(Palette.text)
                 Text(SetupText.emptyBody).font(.system(size: 11)).foregroundStyle(Palette.muted)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(SetupText.emptyHint).font(.system(size: 11)).foregroundStyle(Palette.muted)
-                    .fixedSize(horizontal: false, vertical: true)
+                if let onSetUp {
+                    Button(L("Set up accounts", "Настроить аккаунты"), action: onSetUp)
+                        .buttonStyle(FilledButtonStyle())
+                        .padding(.top, 6)
+                } else {
+                    Text(SetupText.emptyHint).font(.system(size: 11)).foregroundStyle(Palette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 Text(SetupText.widgetEmpty).font(.system(size: 12)).foregroundStyle(Palette.muted)
             }

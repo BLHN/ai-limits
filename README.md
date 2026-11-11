@@ -56,9 +56,9 @@ scripts/install.sh         # copies "AI Limits.app" to ~/Applications and opens 
 
 ### First run
 
-1. Look for the gauge icon in the menu bar. Left-click opens the popover with the **Limits** and **Analytics** tabs. Right-click (or Control-click) opens the menu: Refresh Now, Update Prices, Floating Panel, Launch at Login, Quit AI Limits. The app has no Dock icon. A small floating panel with the same limits also appears in the top-right corner of the screen and stays above other windows; turn it off with "Floating Panel" in the menu (the choice is remembered), or drag it where you want it.
-2. Accounts are detected automatically (see [Accounts](#accounts-configuration)). Codex numbers appear within a minute; each Claude login takes about 15 seconds per check. Until an account's first check succeeds it shows an amber "no data" and "No limits reported", and the footer says "Data delayed". If a check fails, the account shows a short reason in amber instead (hover it for details): "Run claude once in the probe folder — see README" (the trust step below), "Not logged in or no plan limits", "claude not found" / "codex not found", or "Check failed — run AILimits --check". For the full error, run `"$HOME/Applications/AI Limits.app/Contents/MacOS/AILimits" --check` in a terminal. If no CLI is found at all, the panel says "No accounts yet".
-3. **Trust the Claude probe folder once.** The app runs `claude /usage` inside its own folder, `~/Library/Application Support/AILimits/ClaudeProbe`. If Claude Code asks whether you trust that folder, the app never answers for you: the check fails with "the probe folder is not trusted yet" and that account shows no data. Answer the prompt yourself once per Claude login:
+1. Look for the gauge icon in the menu bar. Left-click opens the popover with the **Limits** and **Analytics** tabs. Right-click (or Control-click) opens the menu: Refresh Now, Accounts…, Update Prices, Floating Panel, Launch at Login, Quit AI Limits. The app has no Dock icon. A small floating panel with the same limits also appears in the top-right corner of the screen and stays above other windows; turn it off with "Floating Panel" in the menu (the choice is remembered), or drag it where you want it.
+2. On a fresh install the setup window opens by itself and walks you through connecting every account (see [Getting started](#getting-started)). Accounts are also detected automatically (see [Accounts](#accounts-configuration)). Codex numbers appear within a minute; each Claude login takes about 15 seconds per check. Until an account's first check succeeds it shows an amber "no data" and "No limits reported", and the footer says "Data delayed". If a check fails, the account shows a short reason in amber instead (hover it for details): "Run claude once in the probe folder — see README" (the trust step below), "Not logged in or no plan limits", "claude not found" / "codex not found", or "Check failed — run AILimits --check". For the full error, run `"$HOME/Applications/AI Limits.app/Contents/MacOS/AILimits" --check` in a terminal. If no CLI is found at all, the panel says "No accounts yet".
+3. **Trust the Claude probe folder once.** The app runs `claude /usage` inside its own folder, `~/Library/Application Support/AILimits/ClaudeProbe`. If Claude Code asks whether you trust that folder, the app never answers for you: the check fails with "the probe folder is not trusted yet" and that account shows no data. Answer the prompt yourself once per Claude login. The setup window's **Open Terminal** button starts this session for you; by hand it is:
 
    ```sh
    mkdir -p ~/Library/Application\ Support/AILimits/ClaudeProbe
@@ -70,6 +70,23 @@ scripts/install.sh         # copies "AI Limits.app" to ~/Applications and opens 
    Depending on your Claude Code settings the prompt may not appear at all; then there is nothing to do.
 4. **Add the widget.** Open the widget gallery (right-click the desktop, then Edit Widgets, or the Notification Center), search for AI Limits and add **All accounts** in the medium or large size. If it is not in the gallery, read [Signing and the widget](#signing-and-the-widget).
 5. **Launch at login.** Turn on "Launch at Login" in the icon's menu. macOS may ask you to approve it in System Settings > General > Login Items.
+
+## Getting started
+
+On the first launch of a fresh install (no `accounts.json` and no history yet) AI Limits opens a short setup window. Open it again at any time with **Accounts…** in the menu bar icon's menu, with **Set up accounts** in an empty panel, or with **Fix** next to an account whose check failed.
+
+<p><img src="docs/screenshots/onboarding-accounts.png" width="440" alt="Accounts step of the setup window"></p>
+
+1. **Welcome**: what the app does and what it never touches.
+2. **Accounts**: one card per account (up to 4), each checked live by the app's normal check. The list starts with what is configured or detected, plus extra Claude logins found in your home folder: folders named `.claude-something` that contain a `.claude.json` file (only folder names and the file's existence are checked; nothing is read). A card shows "Connected · Week 83% left" or what is missing, with the button that fixes it:
+   - CLI not installed: **Install guide** opens the official install page; then **I installed it, check again**.
+   - Claude asks to trust the probe folder, or the login is not signed in: **Open Terminal** starts your own `claude` in the probe folder (with `CLAUDE_CONFIG_DIR` for an extra login), or `codex login`, and prints one line saying what to do. You answer the trust prompt or type `/login` yourself; the card re-checks by itself for up to 3 minutes. **Copy command** gives the same command for another terminal app.
+   - Any other failure: **Check again**, and the app's error text under **Details**.
+
+   **Add Claude account** adds the default login first; after that it asks for a short name and a separate login folder (`~/.claude-<name>`, editable), creates the folder (mode 0700), and the new card then takes you through signing in there. **Add Codex** appears when there is no Codex account (Codex has one login). Names can be edited on the cards. Changes are written to `accounts.json` as you make them and again on **Continue**; an existing `cli` block and any keys the app does not know are kept.
+3. **Finish**: Launch at login, the floating panel, and how to add the widget. **Done** closes the window; it does not open again by itself.
+
+The Terminal scripts are written to `~/Library/Application Support/AILimits/Onboarding/`. They contain only fixed commands (`cd` to the probe folder, the login folder variable, one printed instruction and your CLI); AI Limits never types into Terminal. `--onboarding` opens the window at launch (useful for screenshots).
 
 ## Accounts configuration
 
@@ -189,6 +206,7 @@ The app binary is `~/Applications/AI Limits.app/Contents/MacOS/AILimits`.
 | `AILimits --prices` | Prints the merged price table with the source of each entry and the download dates. |
 | `AILimits --update-prices` | Downloads and validates the two pricing pages now and writes `prices-auto.json`. |
 | `AILimits --launch-at-login [enable\|disable\|status]` | Turns the login item on or off, or prints its status (default `status`). |
+| `AILimits --onboarding` | Starts the menu bar app and opens the setup window. |
 
 Without a flag the binary starts the menu bar app.
 
@@ -197,6 +215,7 @@ Without a flag the binary starts the menu bar app.
 What the app reads:
 
 - `accounts.json`, `billing.json` and `prices.json` in `~/Library/Application Support/AILimits/`, if you create them.
+- While the setup window is open: the names of the folders in your home folder, to suggest extra Claude logins, and whether such a folder contains a `.claude.json` file (the file itself is not opened).
 - Each Claude login's `.claude.json`: the file is read and parsed in memory, and only `oauthAccount.subscriptionCreatedAt` is kept; everything else in it is discarded without being logged or stored.
 - The Claude Code and Codex `*.jsonl` logs listed above: only timestamps, model names, token counters and message ids (hashed). Conversation text, prompts, file contents and working directories are not decoded or stored.
 
@@ -205,6 +224,7 @@ What it runs:
 - `codex app-server`, talking to it over stdin/stdout with three JSON-RPC messages (`initialize`, `initialized`, `account/rateLimits/read`), then stopping it. About once a minute.
 - `claude /usage` in a pseudo-terminal, in the folder `~/Library/Application Support/AILimits/ClaudeProbe`, with all `CLAUDE*` and `ANTHROPIC*` environment variables removed (and `CLAUDE_CONFIG_DIR` set only for an account that has `configDir`). The app sends no keystrokes to Claude (so it never answers the folder trust prompt); it only resizes the terminal once to get a fresh repaint, parses the screen text and stops the process. Claude logins are checked one after another, about every 2 minutes.
 - Your login shell, only to find a CLI that is not in the usual folders (`command -v <name>`).
+- Terminal, only when you click **Open Terminal** in the setup window: a `.command` script with fixed content that starts your `claude` or `codex login`. The app sends nothing to it.
 
 These CLIs contact their own services the way they always do when you run them; the app adds no requests of its own to those services and sends no model requests.
 
@@ -217,6 +237,9 @@ What it writes, all under `~/Library/Application Support/AILimits/` (every file 
 - `usage-cache.json` and `usage-cache.seen`: token counts per day and model, hashed file paths and message ids, and the system time zone name (the cache is rebuilt when the zone changes).
 - `prices-auto.json`: the downloaded prices.
 - the empty `ClaudeProbe` folder.
+- `accounts.json`, when you change accounts in the setup window (a previous file that is not valid JSON is kept as `accounts.json.bak`).
+- `Onboarding/`: the Terminal scripts of the setup window (`claude-<id>.command`, `codex.command`, mode 0700).
+- An extra Claude login folder you add in the setup window (for example `~/.claude-work`, mode 0700) is created in your home folder; Claude Code fills it when you sign in.
 
 Network: the only network code in the app is the price update: an anonymous HTTPS GET of the two pricing pages above, with an ephemeral session (no cookies, no cache, no credentials), a fixed User-Agent `AILimits/<version>`, a 20 second timeout, a 2 MB size cap, and redirects to other hosts refused. Nothing derived from your data is sent.
 
@@ -274,12 +297,13 @@ If you change `AI_LIMITS_BUNDLE_ID`, pick an id that is yours (for example `com.
 
    ```sh
    rm -rf ~/Applications/AI\ Limits.app
-   rm -rf ~/Library/Application\ Support/AILimits
+   rm -rf ~/Library/Application\ Support/AILimits   # includes the Onboarding scripts
    defaults delete local.ai-limits 2>/dev/null   # app preferences; use your bundle id if you changed it
    ```
 
 4. Optional leftovers:
    - macOS keeps the widget extension's sandbox container, `~/Library/Containers/local.ai-limits.widget` (your bundle id + `.widget`). AI Limits keeps none of its files there; delete it in Finder if you like (macOS may ask for permission).
+   - Extra Claude login folders such as `~/.claude-work` belong to Claude Code and stay; delete one only if you no longer use that login.
    - Claude Code remembers that you trusted the `ClaudeProbe` folder in its own settings (`.claude.json` of each login). AI Limits does not edit that file; the entry is harmless once the folder is gone.
    - If you ever turned on Launch at Login while running the app from the `build` folder, the login item points there. Turn it off with that copy (`"build/AI Limits.app/Contents/MacOS/AILimits" --launch-at-login disable`) or remove it in System Settings > General > Login Items.
 
@@ -296,6 +320,7 @@ Sources/Shared/                code used by both the app and the widget
   L10n.swift                   English/Russian strings and language choice
 Sources/App/                   menu bar app (host)
   AILimits.swift               app delegate, scheduling, menu, CLI flags, self-test
+  Onboarding.swift             setup window: welcome, account cards with fixes, finish
   Accounts.swift               accounts.json, auto-detection, CLI lookup
   Fetchers.swift               codex app-server and claude /usage fetchers, billing.json
   Analytics.swift              log scanner, usage cache, totals
@@ -313,8 +338,8 @@ docs/screenshots/              images used in this README
 ## Development
 
 - Build: `./build.sh [build_dir]`. The host binary is compiled directly with `swiftc` from every file in `Sources/Shared` and `Sources/App`; the widget is built from `AILimitsWidget.xcodeproj` with `xcodebuild`. Both target macOS 14 on arm64.
-- Tests: `build.sh` runs `AILimits --self-test`, which covers the `/usage` and Codex parsers, `accounts.json` handling, payment dates, pace, history, the log scanner on synthetic files and the price page parsers. Run it in Russian too: `AI_LIMITS_LANG=ru build/AILimits --self-test`.
-- Previews: `tools/preview/render.sh [out_dir]` renders the widget sizes, the floating panel and both popover tabs from fixture data to PNG, without running the app. `AI_LIMITS_LANG=en|ru` picks the language.
+- Tests: `build.sh` runs `AILimits --self-test`, which covers the `/usage` and Codex parsers, `accounts.json` handling and writing, login discovery and Terminal script quoting, payment dates, pace, history, the log scanner on synthetic files and the price page parsers. Run it in Russian too: `AI_LIMITS_LANG=ru build/AILimits --self-test`.
+- Previews: `tools/preview/render.sh [out_dir]` renders the widget sizes, the floating panel, both popover tabs and the setup window steps (`onboarding-*.png`) from fixture data to PNG, without running the app. `AI_LIMITS_LANG=en|ru` picks the language.
 - Adding a file to `Sources/Shared`: the host build picks it up automatically, but the widget target lists its files explicitly. Add it to `AILimitsWidget.xcodeproj` (a `PBXFileReference`, a `PBXBuildFile` and an entry in the widget target's Sources build phase), or open the project in Xcode and tick the AILimitsWidget target for the file.
 - Environment variables for testing: `AI_LIMITS_PROBE_DIR` (another folder for the Claude probe), `AI_LIMITS_USAGE_CACHE` (another cache path), `AI_LIMITS_PRICES_AUTO` (another `prices-auto.json` path), `AI_LIMITS_LANG`.
 - `AILimits --check` runs the real CLIs against your real accounts; it is not part of the automated build.

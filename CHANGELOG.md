@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0 - onboarding
+
+- First-run window that connects Claude and Codex accounts: live checks, one-click fixes in Terminal, extra Claude logins, widget and launch-at-login setup.
+- "Fix" links next to failing accounts in the popover and panel.
+
 ## 1.3.0 - first public release
 
 - Menu bar app and WidgetKit widget (medium and large) for Claude Code and Codex subscription limits: session, week and per-model weekly windows with reset times, for up to 4 accounts.

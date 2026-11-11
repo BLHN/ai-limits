@@ -178,6 +178,18 @@ func fetchHint(_ failure: FetchFailure, kind: AccountKind) -> String {
     }
 }
 
+/// Short reason shown next to a "Fix" link (the host app), where the fix itself is one click away.
+func fixHint(_ failure: FetchFailure, kind: AccountKind) -> String {
+    switch failure {
+    case .probeNotTrusted: return L("Claude needs your OK once", "Claude ждёт вашего разрешения")
+    case .notLoggedIn: return L("Not signed in or no plan limits", "Нет входа или у тарифа нет лимитов")
+    case .cliNotFound:
+        return kind == .codex ? L("Codex CLI is not installed", "Codex CLI не установлен")
+                              : L("Claude Code is not installed", "Claude Code не установлен")
+    case .failed: return L("Check failed", "Проверка не удалась")
+    }
+}
+
 /// Longer tooltip text for the same failure.
 func fetchHintDetail(_ failure: FetchFailure, kind: AccountKind) -> String {
     switch failure {

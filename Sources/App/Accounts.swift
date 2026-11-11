@@ -174,6 +174,248 @@ func loadAccountsConfiguration() -> AccountsConfiguration {
     return configuration
 }
 
+// MARK: - Writing accounts.json (onboarding)
+
+/// One account as the onboarding window edits it.
+struct AccountDraft: Identifiable, Equatable, Sendable {
+    var id: String
+    var kind: AccountKind
+    var name: String
+    /// Claude: CLAUDE_CONFIG_DIR (nil = default login). Codex: CODEX_HOME (nil = default).
+    var directory: String?
+
+    init(id: String, kind: AccountKind, name: String, directory: String?) {
+        self.id = id
+        self.kind = kind
+        self.name = name
+        self.directory = directory
+    }
+
+    init(_ config: AccountConfig) {
+        self.init(id: config.id, kind: config.kind, name: config.name, directory: config.directory)
+    }
+
+    /// Same login as a resolved account: kind and folder match (the name may differ).
+    func sameLogin(as config: AccountConfig) -> Bool {
+        config.id == id && config.kind == kind && config.directory == directory
+    }
+}
+
+/// "~/x" for paths inside `home`, the path itself otherwise.
+func displayPath(_ path: String, home: URL) -> String {
+    let base = home.path.hasSuffix("/") ? String(home.path.dropLast()) : home.path
+    if path == base { return "~" }
+    if path.hasPrefix(base + "/") { return "~" + path.dropFirst(base.count) }
+    return path
+}
+
+/// Lowercase ASCII slug for folder names: Latin transliteration, [a-z0-9] runs joined by "-",
+/// at most 24 characters. Empty when nothing usable is left.
+func accountSlug(_ name: String) -> String {
+    let latin = name.applyingTransform(.toLatin, reverse: false)?
+        .applyingTransform(.stripDiacritics, reverse: false) ?? name
+    var slug = ""
+    var pendingDash = false
+    for scalar in latin.lowercased().unicodeScalars {
+        if ("a"..."z").contains(scalar) || ("0"..."9").contains(scalar) {
+            if pendingDash && !slug.isEmpty { slug += "-" }
+            pendingDash = false
+            slug.unicodeScalars.append(scalar)
+        } else {
+            pendingDash = true
+        }
+    }
+    while slug.count > 24 { slug = String(slug.prefix(24)) }
+    while slug.hasSuffix("-") { slug.removeLast() }
+    return slug
+}
+
+/// Smallest free "claude-N", N >= 1.
+func nextClaudeID(existing: [String]) -> String {
+    var number = 1
+    while existing.contains("claude-\(number)") { number += 1 }
+    return "claude-\(number)"
+}
+
+/// "~/.claude-<slug>" for a new Claude login; "-2", "-3"... when the folder is already in use
+/// (by another account or on disk, as `exists` says).
+func suggestedClaudeFolder(name: String, home: URL, taken: [String], exists: (String) -> Bool) -> String {
+    let slug = accountSlug(name)
+    let base = ".claude-" + (slug.isEmpty ? "account" : slug)
+    var candidate = base
+    var number = 2
+    func path(_ folder: String) -> String { home.appendingPathComponent(folder).path }
+    while taken.contains(path(candidate)) || exists(path(candidate)) {
+        candidate = "\(base)-\(number)"
+        number += 1
+    }
+    return "~/" + candidate
+}
+
+/// Label for a found login folder: ".claude-work" -> "Claude Work", ".claude2" -> "Claude 2".
+func suggestedName(forClaudeFolder path: String) -> String {
+    let folder = (path as NSString).lastPathComponent
+    var rest = folder.hasPrefix(".claude") ? String(folder.dropFirst(7)) : folder
+    rest = rest.trimmingCharacters(in: CharacterSet(charactersIn: "-_. "))
+    let words = rest.split(whereSeparator: { $0 == "-" || $0 == "_" || $0 == "." || $0 == " " })
+        .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+    return String((["Claude"] + words).joined(separator: " ").prefix(32))
+}
+
+/// Extra Claude logins in `home`: folders whose name starts with ".claude" (not ".claude"
+/// itself) that contain a ".claude.json" file. Only directory names and the file's existence
+/// are checked; nothing is read. Sorted by name, at most `limit`.
+func discoverClaudeLogins(home: URL, limit: Int = 8, fileManager: FileManager = .default) -> [String] {
+    guard let names = try? fileManager.contentsOfDirectory(atPath: home.path) else { return [] }
+    var found: [String] = []
+    for name in names.sorted(by: { $0.localizedStandardCompare($1) == .orderedAscending })
+    where name.hasPrefix(".claude") && name != ".claude" {
+        let path = home.appendingPathComponent(name).path
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue,
+              fileManager.fileExists(atPath: path + "/.claude.json") else { continue }
+        found.append(path)
+        if found.count >= limit { break }
+    }
+    return found
+}
+
+/// New accounts.json content for `drafts`. A top-level "cli" block and any other top-level keys
+/// of `existing` are kept, and so are unknown keys inside an existing entry with the same id.
+/// Folders inside `home` are written as "~/...".
+func accountsFileData(drafts: [AccountDraft], existing: Data?, home: URL) throws -> Data {
+    var object = existing.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+    var previous: [String: [String: Any]] = [:]
+    for item in object["accounts"] as? [Any] ?? [] {
+        if let entry = item as? [String: Any], let id = entry["id"] as? String, previous[id] == nil { previous[id] = entry }
+    }
+    object["accounts"] = drafts.map { draft -> [String: Any] in
+        var entry = previous[draft.id] ?? [:]
+        entry["id"] = draft.id
+        entry["type"] = draft.kind.rawValue
+        let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        entry["name"] = name.isEmpty ? nil : String(name.prefix(32))
+        entry["configDir"] = nil
+        entry["home"] = nil
+        if let directory = draft.directory {
+            entry[draft.kind == .claude ? "configDir" : "home"] = displayPath(directory, home: home)
+        }
+        return entry
+    }
+    return try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+}
+
+/// Atomic write with mode 0600; the folder is created with 0700. A file that is not a JSON
+/// object is kept next to it as accounts.json.bak before it is replaced.
+func writeAccountsFile(drafts: [AccountDraft], to url: URL = accountsURL, home: URL = realHome) throws {
+    let manager = FileManager.default
+    try manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700])
+    let existing = try? Data(contentsOf: url)
+    if let existing, !existing.isEmpty, (try? JSONSerialization.jsonObject(with: existing)) as? [String: Any] == nil {
+        let backup = url.appendingPathExtension("bak")
+        try? existing.write(to: backup, options: .atomic)
+        try? manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+    }
+    let data = try accountsFileData(drafts: drafts, existing: existing, home: home)
+    try data.write(to: url, options: .atomic)
+    try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+}
+
+// MARK: - Terminal scripts (onboarding)
+
+/// POSIX single-quoted word: 'it'\''s'.
+func shellQuote(_ text: String) -> String {
+    "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// What a Terminal session started from the onboarding is for.
+enum TerminalTask: Equatable, Sendable {
+    /// Claude in the probe folder: confirm the trust prompt.
+    case claudeTrust
+    /// Claude in the probe folder: trust (if asked) and /login.
+    case claudeLogin
+    /// `codex login`.
+    case codexLogin
+}
+
+/// The instruction lines a script prints before it starts the CLI.
+func terminalInstructions(_ task: TerminalTask) -> [String] {
+    switch task {
+    case .claudeTrust:
+        return [L("AI Limits: Claude Code will ask whether you trust this folder. Choose \"Yes\".",
+                  "AI Limits: Claude Code спросит, доверяете ли вы этой папке. Выберите «Yes»."),
+                L("Then type /exit and close this window. AI Limits never types here.",
+                  "Потом введите /exit и закройте это окно. AI Limits сам здесь ничего не вводит.")]
+    case .claudeLogin:
+        return [L("AI Limits: if Claude Code asks whether you trust this folder, choose \"Yes\".",
+                  "AI Limits: если Claude Code спросит, доверяете ли вы этой папке, выберите «Yes»."),
+                L("Then type /login, sign in with your Claude subscription, type /exit and close this window.",
+                  "Потом введите /login, войдите в подписку Claude, введите /exit и закройте это окно.")]
+    case .codexLogin:
+        return [L("AI Limits: sign in with your ChatGPT account in the browser page that opens.",
+                  "AI Limits: войдите в аккаунт ChatGPT на открывшейся странице браузера."),
+                L("When it says you are signed in, close this window.",
+                  "Когда вход завершится, закройте это окно.")]
+    }
+}
+
+/// Fixed-content zsh script for a .command file. Every path is single-quoted; nothing is piped
+/// into the CLI, which takes over the terminal through exec. For Claude the environment
+/// matches the app's own check: CLAUDE*/ANTHROPIC* variables are removed and CLAUDE_CONFIG_DIR
+/// is set only for an extra login.
+func terminalScript(task: TerminalTask, cli: String, directory: String?, probeFolder: String, home: URL) -> String {
+    var lines = ["#!/bin/zsh", "# Written by AI Limits. It starts your own CLI; AI Limits never types into it."]
+    let cliFolder = (cli as NSString).deletingLastPathComponent
+    lines.append("export PATH=\(shellQuote(cliFolder)):\"$PATH\"")
+    switch task {
+    case .claudeTrust, .claudeLogin:
+        lines.append("cd \(shellQuote(probeFolder)) || exit 1")
+        lines.append("unset -m 'CLAUDE*' 'ANTHROPIC*'")
+        if let directory { lines.append("export CLAUDE_CONFIG_DIR=\(shellQuote(directory))") }
+    case .codexLogin:
+        lines.append("cd \(shellQuote(home.path)) || exit 1")
+        if let directory { lines.append("export CODEX_HOME=\(shellQuote(directory))") }
+    }
+    lines.append("printf '%s\\n' " + terminalInstructions(task).map(shellQuote).joined(separator: " ") + " ''")
+    lines.append("exec \(shellQuote(cli))" + (task == .codexLogin ? " login" : ""))
+    return lines.joined(separator: "\n") + "\n"
+}
+
+/// A path as a shell word: ~/'rest' inside `home` (the tilde stays outside the quotes so the
+/// shell expands it), the whole path single-quoted otherwise.
+func shellPath(_ path: String, home: URL) -> String {
+    let shown = displayPath(path, home: home)
+    if shown == "~" { return "~" }
+    if shown.hasPrefix("~/") { return "~/" + shellQuote(String(shown.dropFirst(2))) }
+    return shellQuote(path)
+}
+
+/// The same session as one line for another terminal app; the CLI is called by name.
+func terminalCommand(task: TerminalTask, directory: String?, probeFolder: String, home: URL) -> String {
+    switch task {
+    case .claudeTrust, .claudeLogin:
+        let variable = directory.map { "CLAUDE_CONFIG_DIR=\(shellPath($0, home: home)) " } ?? ""
+        // An exported API key would make claude sign in with it instead of the subscription.
+        return "cd \(shellPath(probeFolder, home: home)) && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \(variable)claude"
+    case .codexLogin:
+        return directory.map { "CODEX_HOME=\(shellPath($0, home: home)) codex login" } ?? "codex login"
+    }
+}
+
+var onboardingScriptsFolder: URL { realHome.appendingPathComponent("Library/Application Support/AILimits/Onboarding") }
+
+/// Writes `<name>.command` (mode 0700) into the Onboarding folder (0700) and returns its URL.
+func writeTerminalScript(_ content: String, name: String, folder: URL = onboardingScriptsFolder) throws -> URL {
+    let manager = FileManager.default
+    try manager.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    try? manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+    let url = folder.appendingPathComponent(name + ".command")
+    try Data(content.utf8).write(to: url, options: .atomic)
+    try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    return url
+}
+
 // MARK: - CLI lookup
 
 /// Usual install locations, in order. A GUI app gets a minimal PATH from launchd.
@@ -204,6 +446,9 @@ final class CLILocator: @unchecked Sendable {
     }
 
     func setOverrides(_ value: [String: String]) { lock.lock(); overrides = value; lock.unlock() }
+
+    /// Forgets login-shell "not found" answers, so a CLI the user just installed is looked up again.
+    func forgetMisses() { lock.lock(); shellMisses = [:]; lock.unlock() }
 
     func locate(_ name: String) -> String? {
         lock.lock(); let override = overrides[name]; lock.unlock()

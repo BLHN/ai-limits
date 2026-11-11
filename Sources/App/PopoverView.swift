@@ -69,7 +69,7 @@ struct SegmentSwitch<Value: Hashable>: View {
 }
 
 /// Plain button that dips slightly while pressed.
-private struct PressScale: ButtonStyle {
+struct PressScale: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.97 : 1)
@@ -96,7 +96,7 @@ struct GrowOnAppear<Content: View>: View {
 }
 
 /// Faint highlight under a row while the pointer is over it.
-private struct HoverRow: ViewModifier {
+struct HoverRow: ViewModifier {
     @State private var hovering = false
     func body(content: Content) -> some View {
         content
@@ -125,6 +125,9 @@ struct PopoverContent: View {
     var animated = true
     /// Height the content wants, reported after each layout; the popover window follows it.
     var onHeight: ((CGFloat) -> Void)?
+    /// Open the account setup (empty state) or jump to one failing account.
+    var onSetUp: (() -> Void)?
+    var onFix: ((String) -> Void)?
     @State private var tab: PopoverTab
     @State private var period: UsagePeriod
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -132,9 +135,11 @@ struct PopoverContent: View {
     init(accounts: [AccountRow], now: Date, sourceError: Bool = false, notice: String? = nil, usage: UsageDays, prices: [String: ModelPrice],
          pricesAsOf: Date = builtInPricesDate, firstScanRunning: Bool, lastScan: Date?, history: [HistorySample], codexPlan: String?,
          tab: PopoverTab = .limits, period: UsagePeriod = .week, animated: Bool = true,
-         onHeight: ((CGFloat) -> Void)? = nil) {
+         onHeight: ((CGFloat) -> Void)? = nil, onSetUp: (() -> Void)? = nil, onFix: ((String) -> Void)? = nil) {
         self.animated = animated
         self.onHeight = onHeight
+        self.onSetUp = onSetUp
+        self.onFix = onFix
         self.accounts = accounts
         self.now = now
         self.sourceError = sourceError
@@ -158,7 +163,7 @@ struct PopoverContent: View {
             if tab == .limits {
                 GrowOnAppear(enabled: animated) {
                     LimitsSummary(accounts: accounts, now: now, size: .panel, sourceError: sourceError,
-                                  showsPace: true, showsPin: false, notice: notice)
+                                  showsPace: true, showsPin: false, notice: notice, onSetUp: onSetUp, onFix: onFix)
                 }
             } else {
                 GrowOnAppear(enabled: animated) {

@@ -54,6 +54,12 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
     private var billing: [String: String] = [:]
     /// Category of the last failure per account; cleared by the next success. No CLI text is kept.
     private(set) var lastErrors: [String: FetchFailure] = [:]
+    /// The app's own description of the last failure (FetchError text, never CLI output).
+    private(set) var lastErrorDetails: [String: String] = [:]
+    /// Accounts with a fetch running right now (the onboarding shows "Checking...").
+    private(set) var inFlight: Set<String> = []
+    /// Accounts asked to check now that have not started yet.
+    private(set) var queued: Set<String> = []
     /// Window lengths and plan from the Codex response. Host-only, never published.
     private(set) var codexMeta: CodexMeta?
     /// Resolved accounts; nil until the first load finishes (nothing is fetched or published before).
@@ -120,10 +126,27 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
 
     /// Requests an immediate fetch of every account; in-flight ones run again afterwards.
     func refreshNow() {
+        queued.formUnion(slots.map(\.id))
         for slot in slots {
             if nextDue[slot.id] == .distantFuture { rerunRequested.insert(slot.id) } else { nextDue[slot.id] = .distantPast }
         }
         tick()
+    }
+
+    /// Requests an immediate fetch of these accounts only.
+    func refresh(ids: Set<String>) {
+        let known = Set(slots.map(\.id))
+        for id in ids where known.contains(id) {
+            queued.insert(id)
+            if nextDue[id] == .distantFuture { rerunRequested.insert(id) } else { nextDue[id] = .distantPast }
+        }
+        tick()
+    }
+
+    /// Re-reads accounts.json now (after the onboarding saved it) instead of on the next tick.
+    func reloadConfigurationNow() {
+        accountsDate = accountsModificationDate()
+        reloadConfiguration()
     }
 
     /// Re-reads accounts.json (or re-detects the CLIs) off the main thread.
@@ -142,13 +165,16 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
         let previous = configuration
         guard loaded != previous else { return }
         configuration = loaded
+        queued.formIntersection(loaded.ids)
         // An account whose type or folder changed is another login: drop its old numbers.
         for account in loaded.accounts {
-            if let old = previous?.accounts.first(where: { $0.id == account.id }), old != account {
+            if let old = previous?.accounts.first(where: { $0.id == account.id }),
+               old.kind != account.kind || old.directory != account.directory {
                 usages[account.id] = nil
                 models[account.id] = nil
                 claudeAnchors[account.id] = nil
                 lastErrors[account.id] = nil
+                lastErrorDetails[account.id] = nil
                 if nextDue[account.id] == .distantFuture { rerunRequested.insert(account.id) } else { nextDue[account.id] = .distantPast }
             }
         }
@@ -207,6 +233,8 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
     private func runCodex(_ account: AccountConfig) {
         let id = account.id
         nextDue[id] = .distantFuture
+        inFlight.insert(id)
+        queued.remove(id)
         Task {
             let result = await Task.detached(priority: .utility) { Result { try fetchCodexUsage(account) } }.value
             switch result {
@@ -214,12 +242,15 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
                 usages[id] = reading.usage
                 codexMeta = reading.meta
                 lastErrors[id] = nil
+                lastErrorDetails[id] = nil
                 history.record(id: id, usage: reading.usage, models: [])
                 publishCurrent()
             case .failure(let error):
                 // Keep the previous measurement and its original timestamp.
                 lastErrors[id] = fetchFailure(of: error)
+                lastErrorDetails[id] = (error as? FetchError)?.description
             }
+            inFlight.remove(id)
             finish(id, interval: codexInterval)
         }
     }
@@ -229,7 +260,13 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
         claudeChainRunning = true
         Task {
             for account in accounts {
+                // The account may have been removed while earlier ones ran.
+                guard configuration?.accounts.contains(where: {
+                    $0.id == account.id && $0.kind == account.kind && $0.directory == account.directory
+                }) ?? false else { continue }
                 nextDue[account.id] = .distantFuture
+                inFlight.insert(account.id)
+                queued.remove(account.id)
                 let (result, anchor) = await Task.detached(priority: .utility) {
                     (Result { try fetchClaudeUsage(account) }, claudeSubscriptionAnchor(account))
                 }.value
@@ -239,11 +276,14 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
                     usages[account.id] = reading.usage
                     models[account.id] = reading.models
                     lastErrors[account.id] = nil
+                    lastErrorDetails[account.id] = nil
                     history.record(id: account.id, usage: reading.usage, models: reading.models)
                     publishCurrent()
                 case .failure(let error):
                     lastErrors[account.id] = fetchFailure(of: error)
+                    lastErrorDetails[account.id] = (error as? FetchError)?.description
                 }
+                inFlight.remove(account.id)
                 finish(account.id, interval: claudeInterval)
             }
             claudeChainRunning = false
@@ -263,11 +303,30 @@ func remainingSummary(_ accounts: [AccountRow]) -> String {
     }
 }
 
+/// Live status of one onboarding card from the real checks (Onboarding.swift).
+extension QuotaStore {
+    func checkState(_ draft: AccountDraft) -> AccountCheckState {
+        guard let configuration, configuration.accounts.contains(where: draft.sameLogin) else {
+            return AccountCheckState(saved: false)
+        }
+        let id = draft.id
+        let failure = lastErrors[id]
+        let usage = usages[id]
+        // No result of any kind yet: the first check is due now.
+        let checking = inFlight.contains(id) || queued.contains(id) || (failure == nil && usage == nil)
+        return AccountCheckState(saved: true, checking: checking, failure: failure,
+                                 detail: failure == nil ? nil : lastErrorDetails[id], summary: usage.map(connectedSummary))
+    }
+}
+
 struct Dashboard: View {
     let store: QuotaStore
+    var onSetUp: (() -> Void)? = nil
+    var onFix: ((String) -> Void)? = nil
     var body: some View {
         LimitsSummary(accounts: store.accounts, now: store.now,
-            size: .panel, sourceError: store.allFetchersFailing, notice: store.configurationWarning)
+            size: .panel, sourceError: store.allFetchersFailing, notice: store.configurationWarning,
+            onSetUp: onSetUp, onFix: onFix)
             .padding(18)
             .frame(width: 380)
             .background(Palette.background)
@@ -284,6 +343,8 @@ struct PopoverRoot: View {
     let store: QuotaStore
     let usage: UsageMonitor
     let onHeight: (CGFloat) -> Void
+    var onSetUp: (() -> Void)? = nil
+    var onFix: ((String) -> Void)? = nil
     var body: some View {
         GeometryReader { _ in content }
             .background(Palette.background)
@@ -293,7 +354,8 @@ struct PopoverRoot: View {
                        notice: store.configurationWarning,
                        usage: usage.days, prices: usage.priceBook.prices, pricesAsOf: usage.priceBook.asOf,
                        firstScanRunning: usage.scanning && usage.lastScan == nil, lastScan: usage.lastScan,
-                       history: store.history.recent, codexPlan: codexPlanLabel(store.codexMeta), onHeight: onHeight)
+                       history: store.history.recent, codexPlan: codexPlanLabel(store.codexMeta), onHeight: onHeight,
+                       onSetUp: onSetUp, onFix: onFix)
     }
 }
 
@@ -328,6 +390,7 @@ final class LimitsPanel: NSPanel {
     private let floatingPanelItem = NSMenuItem(title: L("Floating Panel", "Плавающая панель"),
                                                action: #selector(toggleFloatingPanel), keyEquivalent: "")
     private let popover = NSPopover()
+    private lazy var onboarding = OnboardingWindowController { [unowned self] in self.onboardingServices() }
     private let popoverWidth: CGFloat = 380
     /// When the transient popover closed; a click on the icon right after it must not reopen it.
     private var popoverClosedAt = Date.distantPast
@@ -338,7 +401,9 @@ final class LimitsPanel: NSPanel {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let hosting = NSHostingView(rootView: Dashboard(store: store))
+        let hosting = NSHostingView(rootView: Dashboard(store: store,
+            onSetUp: { [weak self] in self?.openOnboarding() },
+            onFix: { [weak self] id in self?.openOnboarding(focus: id) }))
         let size = hosting.fittingSize
         let window = LimitsPanel(contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .nonactivatingPanel],
@@ -369,6 +434,19 @@ final class LimitsPanel: NSPanel {
         applicationMenu.addItem(withTitle: L("Quit AI Limits", "Закрыть AI Limits"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         root.submenu = applicationMenu
         menu.addItem(root)
+        // Text fields in the setup window need the standard editing shortcuts.
+        let editRoot = NSMenuItem()
+        let editMenu = NSMenu(title: L("Edit", "Правка"))
+        editMenu.addItem(withTitle: L("Undo", "Отменить"), action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: L("Redo", "Повторить"), action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: L("Cut", "Вырезать"), action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: L("Copy", "Скопировать"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: L("Paste", "Вставить"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: L("Select All", "Выбрать все"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editRoot.submenu = editMenu
+        menu.addItem(editRoot)
         NSApp.mainMenu = menu
         setUpStatusItem()
         setUpPopover()
@@ -385,6 +463,42 @@ final class LimitsPanel: NSPanel {
             Task { @MainActor in self?.usage.requestScan(force: true) }
         }
         updateTooltip()
+        if CommandLine.arguments.contains("--onboarding") || shouldOfferOnboarding() {
+            openOnboarding()
+        }
+    }
+
+    // MARK: Onboarding
+
+    @objc private func openAccounts() { openOnboarding(step: .accounts) }
+
+    /// The setup window; from a failing account it opens on that account's card.
+    func openOnboarding(step: OnboardingStep? = nil, focus id: String? = nil) {
+        if popover.isShown { popover.performClose(nil) }
+        onboarding.show(step: step, focus: id)
+    }
+
+    private func onboardingServices() -> OnboardingServices {
+        OnboardingServices(
+            configuration: { [unowned self] in store.configuration },
+            state: { [unowned self] draft in store.checkState(draft) },
+            recheck: { [unowned self] ids in store.refresh(ids: ids) },
+            saved: { [unowned self] in store.reloadConfigurationNow() },
+            launchAtLogin: {
+                switch SMAppService.mainApp.status {
+                case .enabled: return .on
+                case .requiresApproval: return .needsApproval
+                default: return .off
+                }
+            },
+            setLaunchAtLogin: { [unowned self] on in setLaunchAtLogin(on) },
+            panelVisible: { [unowned self] in panel?.isVisible == true },
+            setPanelVisible: { [unowned self] on in
+                guard let panel else { return }
+                if on { showPanel() } else { panel.orderOut(nil) }
+                panelPreferred = on
+            },
+            close: { [unowned self] in onboarding.close() })
     }
 
     // MARK: Menu bar icon
@@ -401,12 +515,14 @@ final class LimitsPanel: NSPanel {
         }
         let refresh = NSMenuItem(title: L("Refresh Now", "Обновить сейчас"), action: #selector(refreshNow), keyEquivalent: "")
         refresh.target = self
+        let accounts = NSMenuItem(title: L("Accounts…", "Аккаунты…"), action: #selector(openAccounts), keyEquivalent: "")
+        accounts.target = self
         let updatePrices = NSMenuItem(title: L("Update Prices", "Обновить цены"), action: #selector(refreshPrices), keyEquivalent: "")
         updatePrices.target = self
         launchAtLoginItem.target = self
         floatingPanelItem.target = self
         let quit = NSMenuItem(title: L("Quit AI Limits", "Закрыть AI Limits"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
-        statusMenu.items = [refresh, updatePrices, floatingPanelItem, launchAtLoginItem, .separator(), quit]
+        statusMenu.items = [refresh, accounts, updatePrices, floatingPanelItem, launchAtLoginItem, .separator(), quit]
         statusMenu.delegate = self
         statusItem = item
     }
@@ -431,10 +547,11 @@ final class LimitsPanel: NSPanel {
     }
 
     private func setUpPopover() {
-        let root = PopoverRoot(store: store, usage: usage) { [weak self] height in
+        let root = PopoverRoot(store: store, usage: usage, onHeight: { [weak self] height in
             // Resizing from inside a SwiftUI layout pass is not allowed; the next turn is soon enough.
             DispatchQueue.main.async { self?.setPopoverHeight(height) }
-        }
+        }, onSetUp: { [weak self] in self?.openOnboarding() },
+           onFix: { [weak self] id in self?.openOnboarding(focus: id) })
         let hosting = NSHostingController(rootView: root)
         hosting.sizingOptions = []
         popover.contentViewController = hosting
@@ -501,12 +618,19 @@ final class LimitsPanel: NSPanel {
     @objc private func refreshPrices() { priceUpdater.refreshNow() }
 
     @objc private func toggleLaunchAtLogin() {
+        setLaunchAtLogin(SMAppService.mainApp.status != .enabled)
+    }
+
+    /// Registers or removes the login item; a pending approval opens System Settings instead.
+    private func setLaunchAtLogin(_ on: Bool) {
         let service = SMAppService.mainApp
         do {
-            switch service.status {
-            case .enabled: try service.unregister()
-            case .requiresApproval: SMAppService.openSystemSettingsLoginItems()
-            default: try service.register()
+            switch (service.status, on) {
+            case (.requiresApproval, true): SMAppService.openSystemSettingsLoginItems()
+            case (.enabled, false), (.requiresApproval, false): try service.unregister()
+            case (.enabled, true): break
+            case (_, true): try service.register()
+            default: break
             }
         } catch {
             let alert = NSAlert()
@@ -706,7 +830,138 @@ private let legacySlots = [AccountSlot(id: "codex", kind: .codex, name: "Codex")
     // accounts.json problems are matched as English text; the Russian wording is checked in 330.
     try withLanguage(.en) { try runAccountsSelfTest() }
     try runFetchFailureSelfTest()
+    try runOnboardingSelfTest()
     try runAnalyticsSelfTest()
+}
+
+/// accounts.json writer, login discovery, Terminal scripts and names, on a temporary fake home.
+/// The real Application Support folder and home folder are never touched.
+private func runOnboardingSelfTest() throws {
+    let manager = FileManager.default
+    let temp = manager.temporaryDirectory.appendingPathComponent("ai-limits-selftest-\(UUID().uuidString)")
+    try manager.createDirectory(at: temp, withIntermediateDirectories: true)
+    defer { try? manager.removeItem(at: temp) }
+    let home = temp.appendingPathComponent("home")
+
+    // Writer: keeps "cli" and unknown keys (top level and per entry), ids, "~/" folders, 0600 / 0700.
+    let existing = #"{"accounts":[{"id":"cx","type":"codex","note":"keep"},{"id":"claude-1","type":"claude","name":"Old","color":"red"},{"id":"gone","type":"claude"}],"cli":{"claude":"/opt/tools/claude"},"future":{"a":1}}"#
+    let drafts = [AccountDraft(id: "cx", kind: .codex, name: "Codex", directory: nil),
+                  AccountDraft(id: "claude-1", kind: .claude, name: "  Personal ", directory: nil),
+                  AccountDraft(id: "claude-2", kind: .claude, name: "Work", directory: home.appendingPathComponent(".claude-work").path),
+                  AccountDraft(id: "claude-3", kind: .claude, name: "", directory: "/Volumes/x/claude")]
+    let written = try accountsFileData(drafts: drafts, existing: Data(existing.utf8), home: home)
+    let object = try JSONSerialization.jsonObject(with: written) as? [String: Any] ?? [:]
+    let entries = object["accounts"] as? [[String: Any]] ?? []
+    try expect((object["cli"] as? [String: String]) == ["claude": "/opt/tools/claude"]
+               && (object["future"] as? [String: Int]) == ["a": 1]
+               && entries.map { $0["id"] as? String } == ["cx", "claude-1", "claude-2", "claude-3"]
+               && entries[0]["note"] as? String == "keep" && entries[1]["color"] as? String == "red"
+               && entries[1]["name"] as? String == "Personal" && entries[2]["configDir"] as? String == "~/.claude-work"
+               && entries[3]["name"] == nil && entries[3]["configDir"] as? String == "/Volumes/x/claude"
+               && entries[0]["home"] == nil && entries[0]["configDir"] == nil, 350)
+    let reread = resolveAccounts(fileData: written, home: home, isExecutable: { $0 == "/opt/tools/claude" }) { _, _ in nil }
+    try expect(reread.fromFile && reread.warning == nil && reread.ids == ["cx", "claude-1", "claude-2", "claude-3"]
+               && reread.accounts.map(\.name) == ["Codex", "Personal", "Work", "Claude 3"]
+               && reread.accounts.map(AccountDraft.init).enumerated().allSatisfy { index, draft in
+                   draft.id == drafts[index].id && draft.directory == drafts[index].directory }, 351)
+    let support = temp.appendingPathComponent("Support/AILimits")
+    let file = support.appendingPathComponent("accounts.json")
+    try writeAccountsFile(drafts: drafts, to: file, home: home)
+    func mode(_ url: URL) -> Int { ((try? manager.attributesOfItem(atPath: url.path))?[.posixPermissions] as? NSNumber)?.intValue ?? -1 }
+    try expect(mode(file) == 0o600 && mode(support) == 0o700
+               && (try? Data(contentsOf: file)) == (try accountsFileData(drafts: drafts, existing: nil, home: home)), 352)
+    try Data("not json".utf8).write(to: file)
+    try writeAccountsFile(drafts: Array(drafts.prefix(1)), to: file, home: home)
+    try expect((try? String(contentsOf: file.appendingPathExtension("bak"), encoding: .utf8)) == "not json"
+               && mode(file.appendingPathExtension("bak")) == 0o600
+               && resolveAccounts(fileData: try Data(contentsOf: file), home: home, isExecutable: { _ in false }) { _, _ in nil }.ids == ["cx"], 353)
+
+    // Discovery: only folders named .claude* (not .claude) that hold a .claude.json; sorted; capped.
+    func makeFolder(_ name: String, withState: Bool) throws {
+        let folder = home.appendingPathComponent(name)
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        if withState { try Data("{}".utf8).write(to: folder.appendingPathComponent(".claude.json")) }
+    }
+    try makeFolder(".claude", withState: true)
+    try makeFolder(".claude-work", withState: true)
+    try makeFolder(".claude2", withState: true)
+    try makeFolder(".claude-alt", withState: true)
+    try makeFolder(".claude-empty", withState: false)
+    try makeFolder("claude-nodot", withState: true)
+    try makeFolder(".config", withState: true)
+    try Data("{}".utf8).write(to: home.appendingPathComponent(".claude.json"))
+    try Data("{}".utf8).write(to: home.appendingPathComponent(".claudefile"))
+    let found = discoverClaudeLogins(home: home).map { ($0 as NSString).lastPathComponent }
+    try expect(found == [".claude-alt", ".claude-work", ".claude2"]
+               && discoverClaudeLogins(home: home, limit: 2).count == 2
+               && discoverClaudeLogins(home: temp.appendingPathComponent("missing")).isEmpty, 354)
+
+    // Scripts: every path single-quoted, a quote inside escaped, nothing piped, fixed lines.
+    let cli = "/Users/x/My Tools/it's/claude"
+    let probe = "/Users/x/Library/Application Support/AILimits/ClaudeProbe"
+    let trust = withLanguage(.en) {
+        terminalScript(task: .claudeTrust, cli: cli, directory: "/Users/x/.claude-o'brien", probeFolder: probe, home: home)
+    }
+    let lines = trust.split(separator: "\n").map(String.init)
+    try expect(lines.first == "#!/bin/zsh"
+               && lines.contains("export PATH='/Users/x/My Tools/it'\\''s':\"$PATH\"")
+               && lines.contains("cd '/Users/x/Library/Application Support/AILimits/ClaudeProbe' || exit 1")
+               && lines.contains("unset -m 'CLAUDE*' 'ANTHROPIC*'")
+               && lines.contains("export CLAUDE_CONFIG_DIR='/Users/x/.claude-o'\\''brien'")
+               && lines.last == "exec '/Users/x/My Tools/it'\\''s/claude'"
+               && !trust.contains(" | ") && !trust.contains("<<") && lines.contains { $0.hasPrefix("printf '%s\\n' 'AI Limits: Claude Code will ask") }, 355)
+    let login = terminalScript(task: .claudeLogin, cli: "/opt/c/claude", directory: nil, probeFolder: probe, home: home)
+    let codex = terminalScript(task: .codexLogin, cli: "/opt/c/codex", directory: "/Users/x/codex home", probeFolder: probe, home: home)
+    try expect(!login.contains("CLAUDE_CONFIG_DIR=") && login.hasSuffix("exec '/opt/c/claude'\n")
+               && withLanguage(.ru) { terminalScript(task: .claudeLogin, cli: "/opt/c/claude", directory: nil, probeFolder: probe, home: home) }.contains("/login")
+               && codex.contains("export CODEX_HOME='/Users/x/codex home'") && codex.hasSuffix("exec '/opt/c/codex' login\n")
+               && !codex.contains("unset -m") && codex.contains("cd '\(home.path)' || exit 1"), 356)
+    // The quoting survives a real shell: the shell prints back exactly the original text.
+    for text in [cli, "a 'b' \"c\" $HOME `x` \\ ; & é", ""] {
+        let shell = Process()
+        shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+        shell.arguments = ["-c", "printf %s " + shellQuote(text)]
+        let output = Pipe()
+        shell.standardOutput = output
+        shell.standardInput = FileHandle.nullDevice
+        try shell.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        shell.waitUntilExit()
+        try expect(String(decoding: data, as: UTF8.self) == text, 357)
+    }
+    let script = try writeTerminalScript(trust, name: "claude-test", folder: temp.appendingPathComponent("Onboarding"))
+    try expect(mode(script) == 0o700 && mode(temp.appendingPathComponent("Onboarding")) == 0o700
+               && script.lastPathComponent == "claude-test.command", 358)
+    // Copy commands: "~/" stays outside the quotes so the shell expands it.
+    let fakeHome = URL(fileURLWithPath: "/Users/you")
+    try expect(terminalCommand(task: .claudeTrust, directory: "/Users/you/.claude-work",
+                               probeFolder: "/Users/you/Library/Application Support/AILimits/ClaudeProbe", home: fakeHome)
+               == "cd ~/'Library/Application Support/AILimits/ClaudeProbe' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR=~/'.claude-work' claude"
+               && terminalCommand(task: .claudeLogin, directory: nil, probeFolder: "/tmp/p q", home: fakeHome) == "cd '/tmp/p q' && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude"
+               && terminalCommand(task: .codexLogin, directory: nil, probeFolder: "/tmp", home: fakeHome) == "codex login"
+               && terminalCommand(task: .codexLogin, directory: "/Users/you/it's", probeFolder: "/tmp", home: fakeHome)
+                  == "CODEX_HOME=~/'it'\\''s' codex login", 359)
+
+    // Names, slugs and ids.
+    try expect(accountSlug("Work") == "work" && accountSlug("Claude Work 2") == "claude-work-2"
+               && accountSlug("Работа") == "rabota" && accountSlug("  !!  ") == "" && accountSlug("Café_Team") == "cafe-team"
+               && accountSlug(String(repeating: "ab ", count: 20)).count <= 24 && !accountSlug(String(repeating: "ab ", count: 20)).hasSuffix("-"), 360)
+    try expect(nextClaudeID(existing: []) == "claude-1" && nextClaudeID(existing: ["claude-1", "claude-3", "codex"]) == "claude-2", 361)
+    try expect(suggestedClaudeFolder(name: "Work", home: fakeHome, taken: ["/Users/you/.claude-work"], exists: { _ in false }) == "~/.claude-work-2"
+               && suggestedClaudeFolder(name: "Work", home: fakeHome, taken: [], exists: { $0.hasSuffix(".claude-work") || $0.hasSuffix("-2") }) == "~/.claude-work-3"
+               && suggestedClaudeFolder(name: "", home: fakeHome, taken: [], exists: { _ in false }) == "~/.claude-account", 362)
+    try expect(suggestedName(forClaudeFolder: "/Users/you/.claude-work") == "Claude Work"
+               && suggestedName(forClaudeFolder: "/Users/you/.claude2") == "Claude 2"
+               && suggestedName(forClaudeFolder: "/Users/you/.claude-alt") == "Claude Alt"
+               && displayPath("/Users/you/.claude-x", home: fakeHome) == "~/.claude-x" && displayPath("/Users/youth", home: fakeHome) == "/Users/youth", 363)
+    // Status wording and which failures Terminal can fix.
+    let usage = Usage(provider: "claude", updatedAt: nil, primary: Quota(usedPercent: 60, resetsAt: nil), secondary: Quota(usedPercent: 17, resetsAt: nil))
+    try expect(withLanguage(.en) { connectedSummary(usage) } == "Week 83% left"
+               && withLanguage(.ru) { connectedSummary(usage) } == "Неделя: осталось 83%"
+               && withLanguage(.en) { connectedSummary(Usage(provider: "codex", updatedAt: nil, primary: Quota(usedPercent: 60, resetsAt: nil), secondary: nil)) } == "Session 40% left"
+               && terminalTask(for: .probeNotTrusted, kind: .claude) == .claudeTrust && terminalTask(for: .notLoggedIn, kind: .claude) == .claudeLogin
+               && terminalTask(for: .notLoggedIn, kind: .codex) == .codexLogin && terminalTask(for: .cliNotFound, kind: .claude) == nil
+               && terminalTask(for: .failed, kind: .codex) == nil, 364)
 }
 
 /// Fetch errors carry a typed reason; the UI maps it to fixed hints in both languages.
@@ -1331,6 +1586,7 @@ private func runCheck() -> Bool {
                 print("PASS: Claude /usage parser handles escapes, glued words, missing minutes/Resets, year rollover; trust prompt and empty output are errors.")
                 print("PASS: Codex windows classified by duration; model windows and payment anchors survive publishing; payment dates recur monthly.")
                 print("PASS: accounts.json parsed (defaults, duplicate/bad ids, one codex, at most 4, bad paths, unparseable -> warning + detection); log roots derived; reset zones parsed for any IANA name; fetch failures map to fixed en/ru hints; login-shell misses expire after 5 min.")
+                print("PASS: onboarding writes accounts.json keeping cli/unknown keys and ids (0600, folder 0700, broken file backed up); finds extra Claude logins by folder name and .claude.json presence only; Terminal scripts quote paths with spaces and quotes; slugs, ids and folder names.")
                 print("PASS: pace math, history sampling and pruning, price prefixes, compact numbers in English and Russian, Codex plan; usage days follow DST; log scanner dedupes, skips synthetic, joins chunk-split lines, resumes and rescans shrunk files.")
                 print("PASS: pricing pages parsed by header names (<sup>, link in parentheses, two Haiku 5.5 tiers, later fast/batch tables ignored, 4-column OpenAI table); validation rejects; layers user > downloaded > built-in; prefix lookup; 1-hour cache write cost; 24 h refresh throttle.")
                 return

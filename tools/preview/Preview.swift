@@ -61,6 +61,11 @@ import SwiftUI
         try render(LimitsSummary(accounts: failing, now: now, size: .panel, showsPace: true, showsPin: false).padding(18).frame(width: 380), dir + "/panel-errors.png")
         try render(PopoverContent(accounts: failing, now: now, usage: [:], prices: [:], firstScanRunning: false, lastScan: nil,
                                   history: [], codexPlan: nil, tab: .limits, animated: false), dir + "/popover-errors.png")
+        // In the app the same states link to the setup window: "Fix" per failing account, "Set up accounts" when empty.
+        try render(PopoverContent(accounts: failing, now: now, usage: [:], prices: [:], firstScanRunning: false, lastScan: nil,
+                                  history: [], codexPlan: nil, tab: .limits, animated: false, onSetUp: {}, onFix: { _ in }),
+                   dir + "/popover-errors-fix.png")
+        try render(LimitsSummary(accounts: [], now: now, size: .panel, onSetUp: {}).padding(18).frame(width: 380), dir + "/panel-empty-setup.png")
 
         // Popover fixtures: 30 days of token usage, a week of limit history, a Codex plan.
         let today = usageDay(epoch: now.timeIntervalSince1970)
@@ -103,5 +108,71 @@ import SwiftUI
         try render(popover(.analytics, .today), dir + "/popover-analytics-today.png")
         try render(PopoverContent(accounts: rows, now: now, usage: [:], prices: [:], firstScanRunning: true, lastScan: nil,
                                   history: [], codexPlan: nil, tab: .analytics, period: .month, animated: false), dir + "/popover-analytics-empty.png")
+        try renderOnboarding(dir)
+    }
+
+    /// The setup window's steps and card states, from fixtures (a fake home, fixed check results).
+    @MainActor static func renderOnboarding(_ dir: String) throws {
+        let home = URL(fileURLWithPath: "/Users/you")
+        let probe = home.appendingPathComponent("Library/Application Support/AILimits/ClaudeProbe").path
+        let week83 = Usage(provider: "claude", updatedAt: nil, primary: Quota(usedPercent: 20, resetsAt: nil), secondary: Quota(usedPercent: 17, resetsAt: nil))
+        let week41 = Usage(provider: "codex", updatedAt: nil, primary: nil, secondary: Quota(usedPercent: 59, resetsAt: nil))
+        func model(_ step: OnboardingStep, _ drafts: [AccountDraft], states: [String: AccountCheckState] = [:],
+                   suggestions: [String] = []) -> OnboardingModel {
+            let services = OnboardingServices(
+                configuration: { nil }, state: { states[$0.id] ?? AccountCheckState() }, recheck: { _ in }, saved: {},
+                launchAtLogin: { .off }, setLaunchAtLogin: { _ in }, panelVisible: { true }, setPanelVisible: { _ in }, close: {})
+            let model = OnboardingModel(services: services, step: step, isStatic: true, home: home, probeFolder: probe)
+            model.drafts = drafts
+            model.suggestions = suggestions
+            model.launchAtLogin = .on
+            model.panelVisible = true
+            return model
+        }
+        let codex = AccountDraft(id: "codex", kind: .codex, name: "Codex", directory: nil)
+        let claude = AccountDraft(id: "claude-1", kind: .claude, name: "Claude", directory: nil)
+        let work = AccountDraft(id: "claude-2", kind: .claude, name: "Claude Work", directory: "/Users/you/.claude-work")
+        let team = AccountDraft(id: "claude-3", kind: .claude, name: "Team", directory: "/Users/you/.claude-team")
+        func view(_ model: OnboardingModel) -> some View { OnboardingView(model: model) }
+
+        try render(view(model(.welcome, [])), dir + "/onboarding-welcome.png")
+        // The core state: connected, checking, a trust prompt to fix, one more login found.
+        let main = model(.accounts, [codex, claude, work],
+                         states: ["codex": AccountCheckState(summary: connectedSummary(week41)),
+                                  "claude-1": AccountCheckState(checking: true),
+                                  "claude-2": AccountCheckState(failure: .probeNotTrusted, detail: nil)],
+                         suggestions: ["/Users/you/.claude-alt"])
+        try render(view(main), dir + "/onboarding-accounts.png")
+        // The same, after "Open Terminal": the card waits and re-checks by itself.
+        main.watching["claude-2"] = Date().addingTimeInterval(120)
+        try render(view(main), dir + "/onboarding-accounts-waiting.png")
+        // Other failures: CLI missing, not signed in, a failed check with its details open.
+        let errors = model(.accounts, [codex, claude, work],
+                           states: ["codex": AccountCheckState(failure: .cliNotFound),
+                                    "claude-1": AccountCheckState(failure: .notLoggedIn),
+                                    "claude-2": AccountCheckState(failure: .failed, detail: "Claude: claude exited without output")])
+        errors.expandedDetails = ["claude-2"]
+        try render(view(errors), dir + "/onboarding-accounts-errors.png")
+        // Four accounts: adding is disabled with the reason, a found login cannot be added.
+        let full = model(.accounts, [codex, claude, work, team],
+                         states: ["codex": AccountCheckState(summary: connectedSummary(week41)),
+                                  "claude-1": AccountCheckState(summary: connectedSummary(week83)),
+                                  "claude-2": AccountCheckState(summary: connectedSummary(week83)),
+                                  "claude-3": AccountCheckState(failure: .notLoggedIn)],
+                         suggestions: ["/Users/you/.claude-alt"])
+        try render(view(full), dir + "/onboarding-accounts-full.png")
+        // Adding an extra Claude login.
+        let adding = model(.accounts, [codex, claude],
+                           states: ["codex": AccountCheckState(summary: connectedSummary(week41)),
+                                    "claude-1": AccountCheckState(summary: connectedSummary(week83))])
+        adding.addForm = AddClaudeForm(name: L("Work", "Работа"), folder: L("~/.claude-work", "~/.claude-rabota"))
+        try render(view(adding), dir + "/onboarding-add.png")
+        // Nothing detected yet.
+        try render(view(model(.accounts, [])), dir + "/onboarding-accounts-empty.png")
+        try render(view(model(.finish, [codex, claude, work],
+                              states: ["codex": AccountCheckState(summary: connectedSummary(week41)),
+                                       "claude-1": AccountCheckState(summary: connectedSummary(week83)),
+                                       "claude-2": AccountCheckState(summary: connectedSummary(week83))])),
+                   dir + "/onboarding-finish.png")
     }
 }

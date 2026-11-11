@@ -427,14 +427,16 @@ func loadBillingOverrides() -> [String: String] {
     return result
 }
 
-func claudeProbeDirectory() throws -> URL {
-    let environment = ProcessInfo.processInfo.environment
-    let directory: URL
-    if let custom = environment["AI_LIMITS_PROBE_DIR"], !custom.isEmpty {
-        directory = URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
-    } else {
-        directory = realHome.appendingPathComponent("Library/Application Support/AILimits/ClaudeProbe")
+/// Where the Claude probe runs (AI_LIMITS_PROBE_DIR overrides it); not created here.
+var claudeProbeFolderURL: URL {
+    if let custom = ProcessInfo.processInfo.environment["AI_LIMITS_PROBE_DIR"], !custom.isEmpty {
+        return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
     }
+    return realHome.appendingPathComponent("Library/Application Support/AILimits/ClaudeProbe")
+}
+
+func claudeProbeDirectory() throws -> URL {
+    let directory = claudeProbeFolderURL
     do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
     catch { throw FetchError("Claude: cannot create the probe folder") }
     return directory
