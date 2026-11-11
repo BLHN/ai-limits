@@ -1,0 +1,329 @@
+import Foundation
+import Darwin
+
+// Which accounts the app shows and where their CLIs live. The list comes from an optional
+// user-edited accounts.json; without it the installed CLIs are detected. Nothing here reads
+// credentials or account state: only paths and the user's own labels.
+
+struct AccountConfig: Equatable, Sendable {
+    let id: String
+    let kind: AccountKind
+    let name: String
+    /// Claude: passed as CLAUDE_CONFIG_DIR; nil = the default login (the variable stays unset).
+    /// Codex: passed as CODEX_HOME; nil = the inherited environment or ~/.codex.
+    let directory: String?
+
+    var slot: AccountSlot { AccountSlot(id: id, kind: kind, name: name) }
+
+    /// Claude profile state file; only oauthAccount.subscriptionCreatedAt is read from it.
+    var claudeStateFile: URL {
+        directory.map { URL(fileURLWithPath: $0).appendingPathComponent(".claude.json") }
+            ?? realHome.appendingPathComponent(".claude.json")
+    }
+}
+
+struct AccountsConfiguration: Equatable, Sendable {
+    var accounts: [AccountConfig] = []
+    /// "claude" / "codex" -> absolute executable path from accounts.json.
+    var cli: [String: String] = [:]
+    /// Short human-readable problem with accounts.json; nil when there is none.
+    var warning: String?
+    /// false: the list was auto-detected (no file, or a file without usable entries).
+    var fromFile = false
+
+    var slots: [AccountSlot] { accounts.map(\.slot) }
+    var ids: [String] { accounts.map(\.id) }
+    var codex: AccountConfig? { accounts.first { $0.kind == .codex } }
+    var claudeAccounts: [AccountConfig] { accounts.filter { $0.kind == .claude } }
+}
+
+var accountsURL: URL { realHome.appendingPathComponent("Library/Application Support/AILimits/accounts.json") }
+
+func accountsModificationDate() -> Date? {
+    (try? FileManager.default.attributesOfItem(atPath: accountsURL.path))?[.modificationDate] as? Date
+}
+
+/// "~" and "~/x" expand against `home`; the result must be absolute.
+func expandedPath(_ text: String, home: URL) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespaces)
+    var path = trimmed
+    if trimmed == "~" { path = home.path } else if trimmed.hasPrefix("~/") { path = home.path + trimmed.dropFirst(1) }
+    guard path.hasPrefix("/") else { return nil }
+    return (path as NSString).standardizingPath
+}
+
+// MARK: - accounts.json
+
+struct ParsedAccountsFile {
+    var accounts: [AccountConfig]
+    var cli: [String: String]
+    var problems: [String]
+}
+
+/// Pure parser. nil when the data is not a JSON object with an "accounts" list; otherwise bad
+/// entries are dropped with a problem each, and default names are filled in.
+func parseAccountsFile(_ data: Data, home: URL, isExecutable: (String) -> Bool) -> ParsedAccountsFile? {
+    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let list = object["accounts"] as? [Any] else { return nil }
+    var problems: [String] = []
+    var entries: [(id: String, kind: AccountKind, name: String?, directory: String?)] = []
+    for (offset, item) in list.enumerated() {
+        let label = L("entry \(offset + 1)", "запись \(offset + 1)")
+        guard let entry = item as? [String: Any] else {
+            problems.append(L("\(label) is not an object", "\(label) не объект")); continue
+        }
+        guard let id = entry["id"] as? String, isValidAccountID(id) else {
+            problems.append(L("\(label): id must be 1-32 characters a-z, 0-9 or -",
+                              "\(label): id должен быть из 1-32 символов a-z, 0-9 или -")); continue
+        }
+        guard !entries.contains(where: { $0.id == id }) else {
+            problems.append(L("\(label): duplicate id \"\(id)\"", "\(label): повторный id \"\(id)\"")); continue
+        }
+        guard let kind = (entry["type"] as? String).flatMap(AccountKind.init(rawValue:)) else {
+            problems.append(L("\(label): type must be \"claude\" or \"codex\"", "\(label): type должен быть \"claude\" или \"codex\"")); continue
+        }
+        if kind == .codex, entries.contains(where: { $0.kind == .codex }) {
+            problems.append(L("\(label): only one codex account is supported", "\(label): поддерживается только один аккаунт codex")); continue
+        }
+        let key = kind == .claude ? "configDir" : "home"
+        var directory: String?
+        if let raw = entry[key] {
+            guard let text = raw as? String, let path = expandedPath(text, home: home) else {
+                problems.append(L("\(label): \(key) must be an absolute path", "\(label): \(key) должен быть абсолютным путём")); continue
+            }
+            directory = path
+        }
+        let name = (entry["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        entries.append((id, kind, name.flatMap { $0.isEmpty ? nil : String($0.prefix(32)) }, directory))
+    }
+    if entries.count > maxAccounts {
+        problems.append(L("only the first \(maxAccounts) accounts are shown", "показаны только первые \(maxAccounts) \(ruPlural(maxAccounts, "аккаунт", "аккаунта", "аккаунтов"))"))
+        entries = Array(entries.prefix(maxAccounts))
+    }
+    let claudeCount = entries.filter { $0.kind == .claude }.count
+    var claudeIndex = 0
+    let accounts = entries.map { entry -> AccountConfig in
+        var fallback = "Codex"
+        if entry.kind == .claude {
+            claudeIndex += 1
+            fallback = claudeCount == 1 ? "Claude" : "Claude \(claudeIndex)"
+        }
+        return AccountConfig(id: entry.id, kind: entry.kind, name: entry.name ?? fallback, directory: entry.directory)
+    }
+    var cli: [String: String] = [:]
+    if let overrides = object["cli"] as? [String: Any] {
+        for name in ["claude", "codex"] {
+            guard let raw = overrides[name] else { continue }
+            if let text = raw as? String, let path = expandedPath(text, home: home), isExecutable(path) {
+                cli[name] = path
+            } else {
+                problems.append(L("cli.\(name) is not an executable file", "cli.\(name) не исполняемый файл"))
+            }
+        }
+    }
+    return ParsedAccountsFile(accounts: accounts, cli: cli, problems: problems)
+}
+
+private func warningText(_ problems: [String]) -> String? {
+    guard !problems.isEmpty else { return nil }
+    let shown = problems.prefix(2).joined(separator: "; ")
+    let more = problems.count - 2
+    return "accounts.json: " + shown + (more > 0 ? L("; and \(more) more", "; и ещё \(more)") : "")
+}
+
+/// The file when it parses into at least one account, else auto-detection: a Codex account
+/// when the codex CLI is found and the default Claude login when the claude CLI is found.
+/// `findCLI(name, override)` locates a CLI; it is only asked during auto-detection.
+func resolveAccounts(fileData: Data?, home: URL, isExecutable: (String) -> Bool,
+                     findCLI: (String, String?) -> String?) -> AccountsConfiguration {
+    var problems: [String] = []
+    var cli: [String: String] = [:]
+    if let fileData {
+        if let parsed = parseAccountsFile(fileData, home: home, isExecutable: isExecutable) {
+            if !parsed.accounts.isEmpty {
+                return AccountsConfiguration(accounts: parsed.accounts, cli: parsed.cli,
+                                             warning: warningText(parsed.problems), fromFile: true)
+            }
+            problems = parsed.problems + [L("no usable accounts, detecting the installed CLIs",
+                                            "нет подходящих аккаунтов, ищу установленные CLI")]
+            cli = parsed.cli
+        } else {
+            problems = [L("not valid JSON with an \"accounts\" list, detecting the installed CLIs",
+                          "не JSON со списком \"accounts\", ищу установленные CLI")]
+        }
+    }
+    var accounts: [AccountConfig] = []
+    if findCLI("codex", cli["codex"]) != nil {
+        accounts.append(AccountConfig(id: "codex", kind: .codex, name: "Codex", directory: nil))
+    }
+    if findCLI("claude", cli["claude"]) != nil {
+        accounts.append(AccountConfig(id: "claude-1", kind: .claude, name: "Claude", directory: nil))
+    }
+    return AccountsConfiguration(accounts: accounts, cli: cli, warning: warningText(problems), fromFile: false)
+}
+
+/// Reads accounts.json (if any) and applies its CLI overrides to the locator.
+/// May ask the login shell for a CLI path, so it runs off the main thread.
+func loadAccountsConfiguration() -> AccountsConfiguration {
+    let data = try? Data(contentsOf: accountsURL)
+    let configuration = resolveAccounts(fileData: data, home: realHome,
+                                        isExecutable: FileManager.default.isExecutableFile(atPath:)) { name, override in
+        CLILocator.shared.locate(name, override: override)
+    }
+    CLILocator.shared.setOverrides(configuration.cli)
+    return configuration
+}
+
+// MARK: - CLI lookup
+
+/// Usual install locations, in order. A GUI app gets a minimal PATH from launchd.
+func cliSearchDirectories(home: URL) -> [String] {
+    [home.appendingPathComponent(".local/bin").path, "/opt/homebrew/bin", "/usr/local/bin",
+     home.appendingPathComponent(".npm-global/bin").path, home.appendingPathComponent(".bun/bin").path,
+     home.appendingPathComponent(".volta/bin").path, home.appendingPathComponent(".claude/local").path]
+}
+
+/// accounts.json override -> usual directories -> the user's login shell. A found path is
+/// remembered for the session; "not found" only for `missTTL`, so a CLI installed later appears.
+final class CLILocator: @unchecked Sendable {
+    static let shared = CLILocator()
+    private let lock = NSLock()
+    /// Serializes login-shell lookups so one name never starts two shells.
+    private let shellLock = NSLock()
+    private var overrides: [String: String] = [:]
+    private var shellAnswers: [String: String] = [:]
+    private var shellMisses: [String: Date] = [:]
+    /// How long a login-shell "not found" is trusted; matches the 5-minute re-detection.
+    let missTTL: TimeInterval
+    /// Login-shell lookup; replaceable for the self-test.
+    private let shellLookup: (String) -> String?
+
+    init(missTTL: TimeInterval = 300, shellLookup: @escaping (String) -> String? = { loginShellLookup($0) }) {
+        self.missTTL = missTTL
+        self.shellLookup = shellLookup
+    }
+
+    func setOverrides(_ value: [String: String]) { lock.lock(); overrides = value; lock.unlock() }
+
+    func locate(_ name: String) -> String? {
+        lock.lock(); let override = overrides[name]; lock.unlock()
+        return locate(name, override: override)
+    }
+
+    func locate(_ name: String, override: String?) -> String? {
+        let manager = FileManager.default
+        if let override, manager.isExecutableFile(atPath: override) { return override }
+        if let found = cliSearchDirectories(home: realHome).map({ "\($0)/\(name)" })
+            .first(where: { manager.isExecutableFile(atPath: $0) }) { return found }
+        return shellLocate(name)
+    }
+
+    /// The login shell's answer, cached: hits for the session, misses for `missTTL`.
+    func shellLocate(_ name: String, now: Date = Date()) -> String? {
+        shellLock.lock()
+        defer { shellLock.unlock() }
+        lock.lock()
+        let hit = shellAnswers[name]
+        let missedAt = shellMisses[name]
+        lock.unlock()
+        if let hit { return hit }
+        if let missedAt, now.timeIntervalSince(missedAt) < missTTL { return nil }
+        let answer = shellLookup(name)
+        lock.lock()
+        if let answer { shellAnswers[name] = answer; shellMisses[name] = nil } else { shellMisses[name] = now }
+        lock.unlock()
+        return answer
+    }
+}
+
+/// `$SHELL -lc 'command -v <name>'` with a short timeout. Only an absolute path to an existing
+/// executable is accepted; whatever else a profile prints is ignored.
+func loginShellLookup(_ name: String, timeout: TimeInterval = 4) -> String? {
+    guard !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) else { return nil }
+    let manager = FileManager.default
+    let environmentShell = ProcessInfo.processInfo.environment["SHELL"]
+    let accountShell = getpwuid(getuid()).flatMap { $0.pointee.pw_shell.map { String(cString: $0) } }
+    guard let shell = [environmentShell, accountShell, "/bin/zsh"].compactMap({ $0 })
+        .first(where: { $0.hasPrefix("/") && manager.isExecutableFile(atPath: $0) }) else { return nil }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: shell)
+    process.arguments = ["-lc", "command -v \(name)"]
+    process.currentDirectoryURL = realHome
+    let output = Pipe()
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    do { try process.run() } catch { return nil }
+    let pid = process.processIdentifier
+    ChildProcesses.shared.add(pid, group: false)
+    defer {
+        if process.isRunning { process.terminate() }
+        let grace = Date().addingTimeInterval(1)
+        while process.isRunning && Date() < grace { usleep(20_000) }
+        if process.isRunning { kill(pid, SIGKILL) }
+        process.waitUntilExit()
+        ChildProcesses.shared.remove(pid)
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    let reader = output.fileHandleForReading.fileDescriptor
+    var collected = Data()
+    // A background job started by a profile may keep the pipe open: stop soon after the shell exits.
+    while Date() < deadline {
+        let slice = min(deadline, Date().addingTimeInterval(0.2))
+        if let chunk = readChunk(reader, until: slice) {
+            if chunk.isEmpty { break }
+            collected.append(chunk)
+        } else if !process.isRunning {
+            break
+        }
+    }
+    let lines = String(decoding: collected, as: UTF8.self).split(whereSeparator: \.isNewline)
+    guard let last = lines.last.map({ $0.trimmingCharacters(in: .whitespaces) }), last.hasPrefix("/"),
+          manager.isExecutableFile(atPath: last) else { return nil }
+    return last
+}
+
+// MARK: - Log roots
+
+extension UsageSources {
+    /// Claude: <configDir or ~/.claude>/projects per Claude account, deduplicated.
+    /// Codex: <home or $CODEX_HOME or ~/.codex>/sessions when a Codex account is configured.
+    init(configuration: AccountsConfiguration, home: URL = realHome,
+         environment: [String: String] = ProcessInfo.processInfo.environment) {
+        var claude: [URL] = []
+        for account in configuration.claudeAccounts {
+            let root = URL(fileURLWithPath: account.directory ?? home.appendingPathComponent(".claude").path)
+                .appendingPathComponent("projects").standardizedFileURL
+            if !claude.contains(where: { $0.path == root.path }) { claude.append(root) }
+        }
+        var codex: [URL] = []
+        if let account = configuration.codex {
+            let base = account.directory ?? environment["CODEX_HOME"].flatMap { expandedPath($0, home: home) }
+                ?? home.appendingPathComponent(".codex").path
+            codex.append(URL(fileURLWithPath: base).appendingPathComponent("sessions").standardizedFileURL)
+        }
+        self.init(claudeRoots: claude, codexRoots: codex)
+    }
+}
+
+// MARK: - CLI report
+
+/// `AILimits --accounts`: the resolved list and any warning. Locates the CLIs, never runs them
+/// (only the login shell may be asked for a path).
+func runAccountsReport() {
+    let configuration = loadAccountsConfiguration()
+    let exists = FileManager.default.fileExists(atPath: accountsURL.path)
+    let source = configuration.fromFile ? "accounts.json" : "auto-detected"
+    print("AI Limits accounts (\(source)); file: \(accountsURL.path)\(exists ? "" : " (not present)")")
+    if configuration.accounts.isEmpty {
+        print("no accounts: install Claude Code or the Codex CLI and log in, or list accounts in accounts.json")
+    }
+    for account in configuration.accounts {
+        let key = account.kind == .claude ? "configDir" : "home"
+        var directory = account.directory ?? "default"
+        if let path = account.directory, !FileManager.default.fileExists(atPath: path) { directory += " (missing)" }
+        let cli = CLILocator.shared.locate(account.kind.rawValue) ?? "not found"
+        print("\(account.id): type=\(account.kind.rawValue) name=\"\(account.name)\" \(key)=\(directory) cli=\(cli)")
+    }
+    print("warning: \(configuration.warning ?? "none")")
+}

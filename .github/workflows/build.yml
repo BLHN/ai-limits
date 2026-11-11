@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    # build.sh produces an arm64-only app; macos-15 runners are Apple silicon.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Swift 6 language mode, the macOS 14 SDK and xcodebuild are needed: Xcode 16 or later.
+      # Betas are skipped.
+      - name: Select the newest Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -n 1)"
+          echo "Using $xcode"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Build (runs --self-test)
+        run: ./build.sh build
+
+      - name: Self-test in Russian
+        run: AI_LIMITS_LANG=ru build/AILimits --self-test

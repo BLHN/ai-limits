@@ -1,0 +1,7 @@
+{
+  "accounts": [
+    { "id": "codex", "type": "codex", "name": "Codex" },
+    { "id": "claude-personal", "type": "claude", "name": "Claude" },
+    { "id": "claude-work", "type": "claude", "name": "Claude Work", "configDir": "~/.claude-work" }
+  ]
+}
