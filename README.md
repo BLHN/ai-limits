@@ -307,6 +307,7 @@ If you change `AI_LIMITS_BUNDLE_ID`, pick an id that is yours (for example `com.
 - Make sure there is only one copy of AI Limits installed, so macOS registers the right extension.
 - Log out and back in, or restart, so the widget list is rebuilt.
 - To check whether macOS registered the extension: `pluginkit -m -v -i local.ai-limits.widget` (use your bundle id + `.widget`).
+- Stuck on old numbers after an update: an old widget process may still be running the previous build. `scripts/install.sh` stops it; after a manual install run `pkill -f AILimitsWidget.appex` once.
 - The widget shows what the app last published; macOS decides when widgets refresh, so it can lag the popover by a few minutes. The app must be running.
 
 **Costs look wrong or a model shows no price.** Run `AILimits --prices` and `AILimits --update-prices`, or add the model to `prices.json`.

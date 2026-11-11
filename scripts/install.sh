@@ -31,5 +31,8 @@ mkdir -p "$target_dir"
 rm -rf "$target_app"
 ditto "$source_app" "$target_app"
 codesign --verify --deep --strict "$target_app"
+# A widget extension process started from the previous copy keeps running the old code,
+# and macOS keeps showing its timeline. Stop it; WidgetKit starts the new one on demand.
+pkill -f "$target_app/Contents/PlugIns/AILimitsWidget.appex/Contents/MacOS/AILimitsWidget" 2>/dev/null || true
 open "$target_app"
 print "Installed: $target_app"
